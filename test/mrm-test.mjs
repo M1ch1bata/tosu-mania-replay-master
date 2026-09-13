@@ -1,0 +1,387 @@
+import fs from "node:fs";
+import vm from "node:vm";
+
+const code = fs.readFileSync(new URL("../main.js", import.meta.url), "utf8");
+
+class E {
+  constructor() {
+    this.style = { setProperty() {} };
+    this.classList = { add() {}, remove() {}, contains() { return false; } };
+    this.children = [];
+    this.textContent = "";
+    this.width = 640;
+    this.height = 480;
+  }
+  appendChild(n) { this.children.push(n); return n; }
+  getContext() { return makeCtx(); }
+}
+
+function makeCtx() {
+  const calls = [];
+  const target = { globalAlpha: 1 };
+  return new Proxy(target, {
+    get: (t, p) => {
+      if (p in t) return t[p];
+      if (p === "calls") return calls;
+      return (...args) => { calls.push(p); };
+    },
+    set: (t, p, v) => { t[p] = v; return true; }
+  });
+}
+
+const mainCtx = makeCtx();
+const doc = {
+  createElement: () => new E(),
+  getElementById: (id) => {
+    if (id === "preview") {
+      const c = new E();
+      c.getContext = () => mainCtx;
+      return c;
+    }
+    return new E();
+  },
+  body: new E()
+};
+
+class WS { constructor(u) { this.url = u; this.readyState = 1; this.sent = []; } send(d) { this.sent.push(d); } close() {} }
+
+const clock = { now: 0 };
+const fakePerformance = { now: () => clock.now };
+const storage = new Map();
+const sb = {
+  console, Date, Math, JSON, Number, Object, Array, Map, Set, String, Boolean, Error, Promise, Float64Array, Uint8Array,
+  parseInt, parseFloat, isNaN, setTimeout, clearTimeout,
+  requestAnimationFrame: () => 0, cancelAnimationFrame: () => {},
+  performance: fakePerformance,
+  WebSocket: WS,
+  localStorage: {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+    removeItem: (k) => storage.delete(k)
+  },
+  fetch: async () => { throw new Error("network disabled"); },
+  location: { host: "127.0.0.1:24050" },
+  document: doc,
+  window: { self: {}, top: {}, COUNTER_PATH: "Mania Replay Master", innerWidth: 640, innerHeight: 480, devicePixelRatio: 1, addEventListener() {} }
+};
+sb.__advance = (ms) => {
+  clock.now += ms;
+};
+sb.globalThis = sb;
+vm.createContext(sb);
+vm.runInContext(code, sb, { filename: "main.js" });
+
+const api = sb.window.__maniaReplayMaster;
+let pass = 0;
+let fail = 0;
+function ok(name, cond, extra) {
+  if (cond) { pass += 1; console.log("PASS ", name, extra === undefined ? "" : JSON.stringify(extra)); }
+  else { fail += 1; console.log("FAIL ", name, extra === undefined ? "" : JSON.stringify(extra)); }
+}
+function close(a, b, eps = 1e-6) {
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((v, i) => close(v, b[i], eps));
+  return Math.abs(a - b) <= eps;
+}
+
+console.log("== judgement windows ==");
+api.state.client = "stable";
+api.state.scoreV2 = false;
+api.state.classicMod = true;
+api.state.odConverted = 8.5;
+api.state.beatmap = null;
+ok("stable v1 OD8.5", close(api.localWindows(), [16.5, 38.5, 71.5, 101.5, 125.5, 162.5]), api.localWindows());
+
+api.state.scoreV2 = true;
+ok("stable v2 OD8.5", close(api.localWindows(), [15.5, 38.5, 71.5, 101.5, 125.5, 162.5]), api.localWindows());
+
+api.state.client = "lazer";
+api.state.scoreV2 = false;
+api.state.classicMod = false;
+api.state.modsRate = 1.5;
+ok("lazer original OD8.5 DT", close(api.localWindows(), [23.5, 57.5, 107.5, 152.5, 188.5, 243.5]), api.localWindows());
+
+api.state.client = "lazer";
+api.state.classicMod = true;
+api.state.modsRate = 1;
+ok("lazer classic OD8.5", close(api.localWindows(), [16.5, 38.5, 71.5, 101.5, 125.5, 162.5]), api.localWindows());
+
+console.log("== window alignment at other ODs ==");
+api.state.client = "stable";
+api.state.odConverted = 10;
+api.state.scoreV2 = true;
+ok("stable v2 OD10", close(api.localWindows(), [13.5, 34.5, 67.5, 97.5, 121.5, 158.5]), api.localWindows());
+api.state.scoreV2 = false;
+ok("stable v1 OD10", close(api.localWindows(), [16.5, 34.5, 67.5, 97.5, 121.5, 158.5]), api.localWindows());
+api.state.odConverted = 0;
+api.state.scoreV2 = true;
+ok("stable v2 OD0", close(api.localWindows(), [22.5, 64.5, 97.5, 127.5, 151.5, 188.5]), api.localWindows());
+api.state.scoreV2 = false;
+ok("stable v1 OD0", close(api.localWindows(), [16.5, 64.5, 97.5, 127.5, 151.5, 188.5]), api.localWindows());
+api.state.odConverted = 8.5;
+api.state.hitWindow = null;
+api.updateWindows();
+ok("recorded hit never classifies as miss", api.classifyError(999) === 4 && api.classifyError(200) === 4 && api.classifyError(16) === 0, [api.classifyError(999), api.classifyError(200), api.classifyError(16)]);
+api.state.client = "stable";
+api.state.scoreV2 = true;
+api.state.odConverted = 8.5;
+api.state.beatmap = null;
+api.state.hitWindow = { perfect: 1, great: 1, good: 1, ok: 1, meh: 1, miss: 1 };
+api.updateWindows();
+ok("stable windows use exact table, not tosu value", close(api.state.windows, [15.5, 38.5, 71.5, 101.5, 125.5, 162.5]), api.state.windows);
+api.state.hitWindow = null;
+api.state.scoreV2 = false;
+api.state.odConverted = 8.5;
+api.updateWindows();
+
+api.state.client = "stable";
+api.state.scoreV2 = false;
+api.state.classicMod = true;
+api.state.modsRate = 1;
+api.state.odConverted = 4;
+
+console.log("== fall speed / review time ==");
+api.state.maniaScrollSpeed = 7;
+api.settings.maniaScrollSpeedOverride = 0;
+api.settings.hitPosition = 200;
+api.settings.reviewTime = 1500;
+const tr = api.effectiveTimeRange(200);
+const postMs = (480 - 200) / (200 / tr);
+ok("fast scroll clamped to 1500ms review", Math.abs(postMs - 1500) < 1, +postMs.toFixed(1));
+api.state.maniaScrollSpeed = 2;
+const trSlow = api.effectiveTimeRange(200);
+const postSlow = (480 - 200) / (200 / trSlow);
+ok("slow scroll keeps natural speed", postSlow >= 1500, +postSlow.toFixed(1));
+api.settings.hitPosition = 80;
+api.state.maniaScrollSpeed = 7;
+const tr80 = api.effectiveTimeRange(80);
+const post80 = (480 - 80) / (80 / tr80);
+ok("line at 80 keeps review >= 1500ms", post80 >= 1500, +post80.toFixed(1));
+
+console.log("== playback rate estimation ==");
+sb.__advance(150);
+api.setTime(0);
+for (let i = 1; i <= 10; i++) {
+  sb.__advance(150);
+  api.setTime(i * 750);
+}
+sb.__advance(75);
+const est = api.renderTime();
+ok("5x playback extrapolation", Math.abs(est - 7875) < 120, +est.toFixed(0));
+
+console.log("== parsing / points ==");
+const osu = [
+  "osu file format v14",
+  "",
+  "[General]",
+  "Mode: 3",
+  "",
+  "[Difficulty]",
+  "CircleSize:4",
+  "OverallDifficulty:8.5",
+  "",
+  "[TimingPoints]",
+  "0,500,4,2,0,100,1,0",
+  "",
+  "[HitObjects]",
+  "64,192,1000,1,0,0:0:0:0:",
+  "192,192,1050,128,0,1500:0:0:0:0:",
+  "320,192,1200,1,0,0:0:0:0:",
+  "448,192,1000,1,0,0:0:0:0:"
+].join("\n");
+const parsed = api.parseOsu(osu);
+ok("parse objects", parsed.objects.length === 4, parsed.objects.length);
+const map = api.buildManiaNotes(parsed, 4);
+ok("native notes", map.notes.length === 4, map.notes.length);
+ok("hold flag", map.notes.find((n) => n.time === 1050).hold === true);
+ok("hold end", map.notes.find((n) => n.time === 1050).endTime === 1500);
+api.state.mapMode = "mania";
+api.state.csConverted = 4;
+api.state.beatmap = map;
+api.state.hitWindow = null;
+api.state.odConverted = 8.5;
+api.updateWindows();
+api.buildPoints();
+ok("point count", api.state.points.length === 5, api.state.points.length);
+
+console.log("== matching (scorev2) ==");
+api.state.client = "stable";
+api.state.scoreV2 = true;
+api.updateWindows();
+api.processError(-5, 1005);
+ok("perfect on chord note 0", api.state.noteState[0].head === 0, api.state.noteState[0].head);
+api.processError(0, 1005);
+ok("chord note 1 matched", api.state.noteState[1].head === 0, api.state.noteState[1].head);
+api.processError(50, 1090);
+ok("good on LN head (note 2)", api.state.noteState[2].head === 2, api.state.noteState[2].head);
+api.sweepMisses(1400);
+ok("missed note 3", api.state.noteState[3].head === -1, api.state.noteState[3].head);
+ok("LN tail not swept yet", api.state.noteState[2].tail === null, api.state.noteState[2].tail);
+
+console.log("== matching (v1 LN release) ==");
+api.state.scoreV2 = false;
+api.updateWindows();
+api.resetJudgements();
+api.processError(120, 1600);
+ok("v1 LN tail match (note 2)", api.state.noteState[2].tail === 4 && api.state.noteState[2].head === 4, {
+  head: api.state.noteState[2].head,
+  tail: api.state.noteState[2].tail
+});
+api.resetJudgements();
+api.processError(-5, 1055);
+ok("v1 LN head match colors whole note", api.state.noteState[2].head === 0 && api.state.noteState[2].tail === 0, {
+  head: api.state.noteState[2].head,
+  tail: api.state.noteState[2].tail
+});
+api.sweepMisses(2000);
+ok("v1 judged LN not overridden to miss", api.state.noteState[2].head === 0 && api.state.noteState[2].tail === 0, {
+  head: api.state.noteState[2].head,
+  tail: api.state.noteState[2].tail
+});
+api.resetJudgements();
+api.processError(-10, 1040);
+api.processError(120, 1620);
+ok("v1 combined LN judgement (head+tail)", api.state.noteState[2].head === 2 && api.state.noteState[2].tail === 2, {
+  head: api.state.noteState[2].head,
+  tail: api.state.noteState[2].tail
+});
+
+console.log("== v1 LN extra events (release + re-press) ==");
+api.resetJudgements();
+api.processError(-5, 1055);
+ok("LN head judged", api.state.noteState[2].head === 0 && api.state.noteState[2].tail === 0, [api.state.noteState[2].head, api.state.noteState[2].tail]);
+api.processError(300, 1360);
+ok("extra event merges into the same LN as worst", api.state.noteState[2].head === 4 && api.state.noteState[2].tail === 4, [api.state.noteState[2].head, api.state.noteState[2].tail]);
+ok("following note not corrupted by merge", api.state.noteState[3].head === null, api.state.noteState[3].head);
+api.processError(0, 1205);
+ok("following note still matches its own error", api.state.noteState[3].head === 0, api.state.noteState[3].head);
+
+console.log("== run cache (prejudged replay timeline) ==");
+api.state.checksum = "unit-map";
+api.resetJudgements();
+api.saveRun(true);
+const runsSaved = api.loadRuns();
+ok("no run stored when empty", runsSaved.length === 0, runsSaved.length);
+api.processError(-5, 1005);
+api.processError(0, 1005);
+api.saveRun(true);
+const runs = api.loadRuns();
+ok("run saved", runs.length === 1 && runs[0].matches.length === 2, runs.length && runs[0].matches.length);
+ok("key is map/mods scoped", api.runStorageKey().includes("stable"), api.runStorageKey());
+api.resetJudgements();
+ok("state reset before apply", api.state.noteState.every((s) => s.head === null));
+api.state.replayUi = true;
+const applied = api.applyRun(runs[0]);
+ok("run applied", applied === true && api.state.cached === true);
+ok("matched notes colored from timeline", api.state.noteState[0].head === 0 && api.state.noteState[1].head === 0, [api.state.noteState[0].head, api.state.noteState[1].head]);
+ok("unmatched become misses", api.state.noteState[2].head === -1 && api.state.noteState[2].tail === -1 && api.state.noteState[3].head === -1, [api.state.noteState[2].head, api.state.noteState[2].tail, api.state.noteState[3].head]);
+ok("action times prebuilt", api.state.notePoints[0].head.at === 1000 - 5, api.state.notePoints[0].head.at);
+api.state.gameState = "play";
+api.onPrecise({ hitErrors: [-5, 0] });
+ok("prefix matches cached run", api.state.cached === true && api.state.cacheChecked === 2, [api.state.cached, api.state.cacheChecked]);
+api.onPrecise({ hitErrors: [-5, 0, 33] });
+ok("prefix mismatch falls back to live", api.state.cached === false && api.state.errorCount === 3, [api.state.cached, api.state.errorCount]);
+api.state.cached = false;
+api.state.runPrefix = [];
+api.resetJudgements();
+api.processError(-5, 1005);
+api.processError(0, 1005);
+const key = api.runStorageKey();
+storage.delete(key);
+ok("in-memory fallback survives storage loss", api.loadRuns().length === 1, api.loadRuns().length);
+storage.set(key, JSON.stringify([{ v: 1, g: 1, matches: [[0, -5]] }]));
+ok("stale run cache discarded", api.loadRuns().length === 0, api.loadRuns().length);
+
+console.log("== retry reset ==");
+api.state.gameState = "play";
+api.state.cached = false;
+api.state.runPrefix = [];
+api.resetJudgements();
+api.state.lastHitsTotal = null;
+api.onV2({ play: { hits: { geki: 5, "300": 3, katu: 1, "100": 1, "50": 0, "0": 0 }, score: 12000, accuracy: 99, failed: false } });
+api.processError(-5, 1005);
+ok("stats accumulated before retry", api.state.statCount === 1, api.state.statCount);
+api.onV2({ play: { hits: { geki: 1, "300": 0, katu: 0, "100": 0, "50": 0, "0": 0 }, score: 150, accuracy: 100, failed: false } });
+ok("retry clears UR/judgements", api.state.statCount === 0 && api.state.errorCount === 0, [api.state.statCount, api.state.errorCount]);
+
+console.log("== miss budget ==");
+api.state.scoreV2 = false;
+api.state.cached = false;
+api.state.hits = { geki: 0, "300": 0, katu: 0, "100": 0, "50": 0, "0": 0 };
+api.state.beatmap = map;
+api.state.csConverted = 4;
+api.state.mapMode = "mania";
+api.buildPoints();
+api.sweepMisses(2000);
+const blockedMisses = api.state.noteState.filter((s) => s.head === -1 || s.tail === -1).length;
+ok("no misses marked while game miss count is 0", blockedMisses === 0, blockedMisses);
+api.state.hits["0"] = 1;
+api.sweepMisses(2000);
+const allowedMisses = api.state.noteState.filter((s) => s.head === -1 || s.tail === -1).length;
+ok("miss marked once budget allows", allowedMisses === 1 && api.state.noteState[0].head === -1, allowedMisses);
+api.state.hits = null;
+
+console.log("== miss skip alignment ==");
+api.state.scoreV2 = false;
+api.state.cached = false;
+api.state.beatmap = map;
+api.state.csConverted = 4;
+api.state.mapMode = "mania";
+api.updateWindows();
+api.state.hits = { geki: 0, "300": 0, katu: 0, "100": 0, "50": 0, "0": 1 };
+api.buildPoints();
+api.consumeMissSkips();
+ok("miss skip marks one tap judgement", api.state.markedMiss === 1 && api.state.noteState[0].head === -1, [api.state.markedMiss, api.state.noteState[0].head]);
+const holdMap = api.buildManiaNotes(
+  api.parseOsu(
+    [
+      "osu file format v14",
+      "",
+      "[General]",
+      "Mode: 3",
+      "",
+      "[Difficulty]",
+      "CircleSize:4",
+      "OverallDifficulty:8.5",
+      "",
+      "[TimingPoints]",
+      "0,500,4,2,0,100,1,0",
+      "",
+      "[HitObjects]",
+      "64,192,1000,128,0,1500:0:0:0:0:",
+      "320,192,2000,1,0,0:0:0:0:"
+    ].join("\n")
+  ),
+  4
+);
+api.state.beatmap = holdMap;
+api.buildPoints();
+api.state.hits = { geki: 0, "300": 0, katu: 0, "100": 0, "50": 0, "0": 1 };
+api.consumeMissSkips();
+ok(
+  "miss skip consumes whole V1 hold as one judgement",
+  api.state.markedMiss === 1 && api.state.noteState[0].head === -1 && api.state.noteState[0].tail === -1 && api.state.noteState[1].head === null,
+  [api.state.markedMiss, api.state.noteState[0].head, api.state.noteState[0].tail, api.state.noteState[1].head]
+);
+api.state.beatmap = map;
+api.buildPoints();
+api.state.hits = null;
+
+console.log("== reset ==");
+api.resetJudgements();
+ok("errors reset", api.state.errorCount === 0 && api.state.noteState.every((s) => s.head === null && s.tail === null));
+
+console.log("== rendering ==");
+api.state.gameState = "play";
+api.state.mapMode = "mania";
+api.state.beatmap = map;
+api.buildPoints();
+api.processError(-5, 1010);
+const before = mainCtx.calls.length;
+api.renderScene(mainCtx, 1200, 1);
+ok("render produced draws", mainCtx.calls.length > before, mainCtx.calls.length - before);
+ok("allowed in play mania", api.allowedState() === true);
+api.state.gameState = "selectPlay";
+ok("hidden in select", api.allowedState() === false);
+
+console.log(`Summary: ${pass}/${pass + fail} passed`);
+process.exit(fail ? 1 : 0);

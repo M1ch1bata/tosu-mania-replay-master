@@ -1,0 +1,202 @@
+[
+    {
+        "uniqueID": "notes",
+        "type": "textarea",
+        "title": "Notes:",
+        "description": "port of Mania-Replay-Master: renders falling notes colored by judgement plus the actual key actions (hit offsets) in real time while playing or watching a replay.\n\nhidden outside gameplay. judgement windows follow the active system: osu!stable (v1 / scorev2) and osu!lazer (original / classic mod), including mod-adjusted OD and rate.\n\nplace this counter as an OBS browser source or in the tosu ingame overlay, then size/position it freely.",
+        "options": [],
+        "value": "feel free to adjust this text. it does nothing."
+    },
+    {
+        "uniqueID": "colorPerfect",
+        "type": "color",
+        "title": "Colour: MAX / 320",
+        "description": "",
+        "options": [],
+        "value": "#ffffff"
+    },
+    {
+        "uniqueID": "colorGreat",
+        "type": "color",
+        "title": "Colour: 300",
+        "description": "",
+        "options": [],
+        "value": "#ffd237"
+    },
+    {
+        "uniqueID": "colorGood",
+        "type": "color",
+        "title": "Colour: 200",
+        "description": "",
+        "options": [],
+        "value": "#79d020"
+    },
+    {
+        "uniqueID": "colorOk",
+        "type": "color",
+        "title": "Colour: 100",
+        "description": "",
+        "options": [],
+        "value": "#1e68c5"
+    },
+    {
+        "uniqueID": "colorMeh",
+        "type": "color",
+        "title": "Colour: 50",
+        "description": "",
+        "options": [],
+        "value": "#e1349b"
+    },
+    {
+        "uniqueID": "colorMiss",
+        "type": "color",
+        "title": "Colour: MISS",
+        "description": "",
+        "options": [],
+        "value": "#ff3b3b"
+    },
+    {
+        "uniqueID": "colorUnjudged",
+        "type": "color",
+        "title": "Colour: Unjudged",
+        "description": "colour of notes that have not been hit yet",
+        "options": [],
+        "value": "#8fa3c8"
+    },
+    {
+        "uniqueID": "colorLongNote",
+        "type": "color",
+        "title": "Colour: Long Note Body",
+        "description": "",
+        "options": [],
+        "value": "#9aa7bd"
+    },
+    {
+        "uniqueID": "noteHeight",
+        "type": "number",
+        "title": "Note Height",
+        "description": "note block height in playfield units (playfield is 480 wide)",
+        "options": [],
+        "value": 22
+    },
+    {
+        "uniqueID": "noteStroke",
+        "type": "number",
+        "title": "Note Border Width",
+        "description": "notes are drawn as hollow outlined rectangles like the reference renderer",
+        "options": [],
+        "value": 2
+    },
+    {
+        "uniqueID": "actionHeight",
+        "type": "number",
+        "title": "Action Height",
+        "description": "height of the filled key action blocks / held-note dashes",
+        "options": [],
+        "value": 7
+    },
+    {
+        "uniqueID": "hitPosition",
+        "type": "number",
+        "title": "Hit Position (60 - 470)",
+        "description": "vertical position of the judgement line in playfield units; keep it small so only a short preview strip stays above the line and the judged area below becomes the main review region",
+        "options": [],
+        "value": 80
+    },
+    {
+        "uniqueID": "hitLineWidth",
+        "type": "number",
+        "title": "Judgement Line Width",
+        "description": "thickness of the judgement line",
+        "options": [],
+        "value": 4
+    },
+    {
+        "uniqueID": "reviewTime",
+        "type": "number",
+        "title": "Judgement Review Time (ms)",
+        "description": "minimum time notes and actions remain visible after the judgement line; lowers the fall speed automatically if the scroll speed would be too fast (default 1500)",
+        "options": [],
+        "value": 1500
+    },
+    {
+        "uniqueID": "statsScale",
+        "type": "number",
+        "title": "Stats Panel Scale",
+        "description": "size of the judgement / accuracy / UR panel in the top-left corner",
+        "options": [],
+        "value": 1.4
+    },
+    {
+        "uniqueID": "maniaScrollSpeedOverride",
+        "type": "number",
+        "title": "Mania Scroll Speed Override (0 = game)",
+        "description": "1 - 40, 0 uses the scroll speed reported by tosu",
+        "options": [],
+        "value": 0
+    },
+    {
+        "uniqueID": "showActions",
+        "type": "checkbox",
+        "title": "Show Key Actions",
+        "description": "draws the actual keypress position and the early / late offset connector",
+        "options": [],
+        "value": true
+    },
+    {
+        "uniqueID": "showStats",
+        "type": "checkbox",
+        "title": "Show Judgement Stats",
+        "description": "counts, accuracy and unstable rate",
+        "options": [],
+        "value": true
+    },
+    {
+        "uniqueID": "showHitLine",
+        "type": "checkbox",
+        "title": "Show Judgement Line",
+        "description": "",
+        "options": [],
+        "value": true
+    },
+    {
+        "uniqueID": "playfieldOpacity",
+        "type": "number",
+        "title": "Playfield Opacity (0 - 1)",
+        "description": "",
+        "options": [],
+        "value": 1
+    },
+    {
+        "uniqueID": "backgroundColor",
+        "type": "color",
+        "title": "Background Color",
+        "description": "",
+        "options": [],
+        "value": "#000000"
+    },
+    {
+        "uniqueID": "backgroundOpacity",
+        "type": "number",
+        "title": "Background Opacity (0 - 1)",
+        "description": "0 keeps the background fully transparent",
+        "options": [],
+        "value": 0
+    },
+    {
+        "uniqueID": "renderScale",
+        "type": "number",
+        "title": "Render Scale (%)",
+        "description": "scales the playfield inside the counter window",
+        "options": [],
+        "value": 100
+    },
+    {
+        "uniqueID": "fpsLimit",
+        "type": "number",
+        "title": "FPS Limit (0 = unlimited)",
+        "description": "cap the redraw rate (e.g. 60) if the ingame overlay stutters",
+        "options": [],
+        "value": 0
+    }
+]

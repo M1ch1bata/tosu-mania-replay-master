@@ -1,0 +1,6 @@
+Usecase: Ingame Overlay, OBS Overlay
+Name: Mania Replay Master
+Version: 0.4.1
+Author: M1ch1bata
+CompatibleWith: Tosu
+Resolution: 640x480
