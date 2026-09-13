@@ -5,8 +5,7 @@
 
 > A real-time mania replay & judgement overlay for tosu, inspired by Mania-Replay-Master.
 
-![V2 长条与按键动作](docs/screenshot-v2.png)
-![V1 长条合成判定](docs/screenshot-v1.png)
+![插件实时运行情况](docs/插件实时运行情况.gif)
 
 ## 1. 插件简介
 
