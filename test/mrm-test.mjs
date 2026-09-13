@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import vm from "node:vm";
 
-const code = fs.readFileSync(new URL("../main.js", import.meta.url), "utf8");
+const code = fs.readFileSync("D:\\Download\\tosu-windows-v4.20.0\\static\\Mania Replay Master\\main.js", "utf8");
 
 class E {
   constructor() {
@@ -362,6 +362,32 @@ ok(
   api.state.markedMiss === 1 && api.state.noteState[0].head === -1 && api.state.noteState[0].tail === -1 && api.state.noteState[1].head === null,
   [api.state.markedMiss, api.state.noteState[0].head, api.state.noteState[0].tail, api.state.noteState[1].head]
 );
+api.state.beatmap = map;
+api.buildPoints();
+api.state.hits = null;
+
+console.log("== stats panel fallback ==");
+api.state.scoreV2 = false;
+api.state.beatmap = map;
+api.state.csConverted = 4;
+api.state.mapMode = "mania";
+api.updateWindows();
+api.state.hits = { geki: 0, "300": 0, katu: 0, "100": 0, "50": 0, "0": 0 };
+api.buildPoints();
+api.processError(-5, 1005);
+api.processError(0, 1005);
+const ps = api.panelStats();
+ok("panel falls back to computed counts", ps.counts[0] === 2 && ps.counts[5] === 0, ps.counts);
+ok("panel computes accuracy from counts", Math.abs(ps.accuracy - 100) < 0.01, ps.accuracy);
+api.state.hits = { geki: 5, "300": 1, katu: 0, "100": 0, "50": 0, "0": 0 };
+const ps2 = api.panelStats();
+ok("panel prefers valid game counts", ps2.counts[0] === 5 && ps2.counts[1] === 1, ps2.counts);
+api.state.beatmap = holdMap;
+api.buildPoints();
+api.state.hits = { geki: 0, "300": 0, katu: 0, "100": 0, "50": 0, "0": 0 };
+api.processError(-5, 1005);
+const ps3 = api.panelStats();
+ok("v1 hold counts once in fallback", ps3.counts[0] === 1, ps3.counts);
 api.state.beatmap = map;
 api.buildPoints();
 api.state.hits = null;

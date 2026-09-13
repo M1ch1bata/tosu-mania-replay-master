@@ -1016,9 +1016,55 @@ function unstableRate() {
   return state.modsRate && state.modsRate !== 1 ? ur / state.modsRate : ur;
 }
 
+function gameHitsTotal() {
+  const h = state.hits;
+  if (!h) return 0;
+  return num(h.geki, 0) + num(h["300"], 0) + num(h.katu, 0) + num(h["100"], 0) + num(h["50"], 0) + num(h["0"], 0);
+}
+
+function computedCounts() {
+  const counts = [0, 0, 0, 0, 0, 0];
+  const notes = state.beatmap && state.beatmap.notes;
+  const ns = state.noteState;
+  if (!notes || !ns) return counts;
+  for (let i = 0; i < notes.length; i++) {
+    const s = ns[i];
+    if (!s) continue;
+    if (notes[i].hold && !state.scoreV2) {
+      if (s.head !== null) counts[s.head < 0 ? 5 : s.head] += 1;
+      continue;
+    }
+    if (s.head !== null) counts[s.head < 0 ? 5 : s.head] += 1;
+    if (notes[i].hold && s.tail !== null) counts[s.tail < 0 ? 5 : s.tail] += 1;
+  }
+  return counts;
+}
+
+function countsAccuracy(counts) {
+  const weights = state.scoreV2
+    ? [305 / 305, 300 / 305, 200 / 305, 100 / 305, 50 / 305, 0]
+    : [1, 1, 2 / 3, 1 / 3, 1 / 6, 0];
+  const total = counts.reduce((a, b) => a + b, 0);
+  if (!total) return 100;
+  let sum = 0;
+  for (let i = 0; i < counts.length; i++) sum += counts[i] * weights[i];
+  return (sum / total) * 100;
+}
+
+function panelStats() {
+  const h = state.hits;
+  if (h && gameHitsTotal() > 0) {
+    return {
+      counts: [num(h.geki, 0), num(h["300"], 0), num(h.katu, 0), num(h["100"], 0), num(h["50"], 0), num(h["0"], 0)],
+      accuracy: state.accuracy
+    };
+  }
+  const counts = computedCounts();
+  return { counts, accuracy: countsAccuracy(counts) };
+}
+
 function drawStats(ctx, opacity) {
-  const hits = state.hits || {};
-  const counts = [num(hits.geki, 0), num(hits["300"], 0), num(hits.katu, 0), num(hits["100"], 0), num(hits["50"], 0), num(hits["0"], 0)];
+  const { counts, accuracy } = panelStats();
   const scale = clamp(num(settings.statsScale, 1.4), 0.5, 4);
   const squareW = 5 * scale;
   const squareH = 10 * scale;
@@ -1049,7 +1095,7 @@ function drawStats(ctx, opacity) {
   }
   y += 2 * scale;
   ctx.fillStyle = "rgba(255,255,255,0.92)";
-  ctx.fillText(`${state.accuracy.toFixed(2)}%`, x + squareW + 4 * scale, y);
+  ctx.fillText(`${accuracy.toFixed(2)}%`, x + squareW + 4 * scale, y);
   y += rowH;
   ctx.fillText(`UR ${unstableRate().toFixed(0)}`, x + squareW + 4 * scale, y);
 }
@@ -1500,6 +1546,7 @@ window.__maniaReplayMaster = {
   renderScene,
   frame,
   unstableRate,
+  panelStats,
   allowedState,
   statusText,
   updateSettings,

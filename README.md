@@ -85,6 +85,8 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
   缓存按「谱面 checksum + 客户端 + mods + 键数 + 判定系统」隔离；不匹配时会自动回退到实时判定。
 - **支持 变速 回放吗？**
   支持。插件会估计播放倍速并对齐时间，高倍速下使用顺序匹配 + MISS 跳段避免错位。
+- **统计面板显示 0 或与游戏不一致？**
+  面板优先使用 tosu 提供的游戏计数；当 tosu 读取不到（部分 stable 版本会出现 `play.hits` 全 0）时，会自动回退为按插件匹配的判定计算，回放复盘（完整时间轴）下直接显示最终统计。UR 始终由插件按判定误差计算。
 - **游戏里看不到插件？**
   确认目录名是 `Mania Replay Master`，且放在 tosu 的 `static` 目录下，然后重启 tosu。
 
