@@ -89,6 +89,7 @@ const state = {
   errorSum: 0,
   errorSq: 0,
   searchFrom: 0,
+  sweepFrom: 0,
   backfillFloor: -Infinity,
   hits: null,
   accuracy: 100,
@@ -407,14 +408,8 @@ function classifyError(e) {
 function classifyLongNote(startError, endError) {
   const w = state.windows;
   if (!w) return 4;
-  const startDiff = Math.abs(startError);
-  const endDiff = Math.abs(endError);
-  const totalDiff = startDiff + endDiff;
-  const fits = (j, rate) => startDiff <= w[j] * rate && totalDiff <= w[j] * rate * 2;
-  if (fits(0, 1.2)) return 0;
-  if (fits(1, 1.1)) return 1;
-  if (fits(2, 1.0)) return 2;
-  if (fits(3, 1.0)) return 3;
+  const avg = (Math.abs(startError) + Math.abs(endError)) / 2;
+  for (let i = 0; i < w.length - 1; i++) if (avg <= w[i]) return i;
   return 4;
 }
 
@@ -478,6 +473,7 @@ function resetJudgements() {
   state.errorSq = 0;
   state.markedMiss = 0;
   state.searchFrom = 0;
+  state.sweepFrom = 0;
   state.backfillFloor = -Infinity;
   const pts = state.points || [];
   for (const p of pts) {
@@ -526,7 +522,8 @@ function processError(e, pressTime) {
         mergeState &&
         state.beatmap &&
         state.beatmap.notes[mergeNote].hold &&
-        (bestOpen < 0 || bestAnyDist <= bestOpenDist)
+        bestAnyDist <= 30 &&
+        (bestOpen < 0 || bestAnyDist + 2 < bestOpenDist)
       ) {
         if (!mergeState.extra) mergeState.extra = [];
         mergeState.extra.push(e);
@@ -614,8 +611,12 @@ function matchPoint(p, e, near) {
   advanceSearchFrom(p.time, near);
 }
 
+function hitsAvailable() {
+  return !!state.hits && gameHitsTotal() > 0;
+}
+
 function canMarkMiss() {
-  if (!state.hits) return true;
+  if (!hitsAvailable()) return true;
   return state.markedMiss < num(state.hits["0"], 0);
 }
 
@@ -632,7 +633,7 @@ function markCandidateMiss(idx) {
 }
 
 function consumeMissSkips() {
-  if (!state.hits) return;
+  if (!hitsAvailable()) return;
   const pts = state.points || [];
   let guard = 0;
   while (canMarkMiss() && guard < 100) {
@@ -659,7 +660,7 @@ function sweepMisses(t) {
   const map = state.beatmap;
   if (!w || !pts || !map) return;
   const missW = w[w.length - 1];
-  for (let i = state.searchFrom; i < pts.length; i++) {
+  for (let i = state.sweepFrom; i < pts.length; i++) {
     const p = pts[i];
     if (p.time > t - missW) break;
     if (p.matched) continue;
@@ -669,9 +670,9 @@ function sweepMisses(t) {
     markPointMiss(p);
     state.markedMiss += 1;
   }
-  let sf = state.searchFrom;
+  let sf = state.sweepFrom;
   while (sf < pts.length && pts[sf].matched) sf++;
-  state.searchFrom = sf;
+  state.sweepFrom = sf;
 }
 
 const runMemory = new Map();
@@ -1319,7 +1320,6 @@ const v2Filters = [
       { field: "mode", keys: ["name"] },
       { field: "mods", keys: ["number", "array", "rate"] },
       "failed",
-      "hitErrorArray",
       "score",
       { field: "hits", keys: ["0", "50", "100", "300", "geki", "katu"] },
       "accuracy"
@@ -1407,7 +1407,6 @@ function applyPlayUpdate(play) {
     state.lastHitsTotal = totalHits;
     if (Number.isFinite(score)) state.lastScore = score;
   }
-  if (!state.cached && Array.isArray(play.hitErrorArray) && play.hitErrorArray.length < state.errorCount) resetJudgements();
 }
 
 function onV2(data) {

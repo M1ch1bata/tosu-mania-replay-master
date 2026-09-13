@@ -306,7 +306,7 @@ ok("retry clears UR/judgements", api.state.statCount === 0 && api.state.errorCou
 console.log("== miss budget ==");
 api.state.scoreV2 = false;
 api.state.cached = false;
-api.state.hits = { geki: 0, "300": 0, katu: 0, "100": 0, "50": 0, "0": 0 };
+api.state.hits = { geki: 5, "300": 0, katu: 0, "100": 0, "50": 0, "0": 0 };
 api.state.beatmap = map;
 api.state.csConverted = 4;
 api.state.mapMode = "mania";
@@ -361,6 +361,37 @@ ok(
   "miss skip consumes whole V1 hold as one judgement",
   api.state.markedMiss === 1 && api.state.noteState[0].head === -1 && api.state.noteState[0].tail === -1 && api.state.noteState[1].head === null,
   [api.state.markedMiss, api.state.noteState[0].head, api.state.noteState[0].tail, api.state.noteState[1].head]
+);
+api.state.beatmap = map;
+api.buildPoints();
+api.state.hits = null;
+
+console.log("== sweep cursor & budget tolerance ==");
+api.state.scoreV2 = false;
+api.state.cached = false;
+api.state.beatmap = map;
+api.state.csConverted = 4;
+api.state.mapMode = "mania";
+api.updateWindows();
+api.state.hits = { geki: 3, "300": 0, katu: 0, "100": 0, "50": 0, "0": 3 };
+api.buildPoints();
+api.processError(250, 1750);
+ok("matcher cursor skipped earlier points", api.state.searchFrom > 3, api.state.searchFrom);
+api.sweepMisses(2000);
+ok(
+  "skipped past notes still marked miss",
+  api.state.noteState[0].head === -1 && api.state.noteState[1].head === -1 && api.state.noteState[3].head === -1,
+  [api.state.noteState[0].head, api.state.noteState[1].head, api.state.noteState[3].head]
+);
+api.state.beatmap = map;
+api.buildPoints();
+api.state.hits = { geki: 0, "300": 0, katu: 0, "100": 0, "50": 0, "0": 0 };
+api.processError(-5, 1005);
+api.sweepMisses(2000);
+ok(
+  "sweep marks misses when game hits unavailable",
+  api.state.noteState[1].head === -1 && api.state.noteState[2].head === -1 && api.state.noteState[3].head === -1,
+  [api.state.noteState[1].head, api.state.noteState[2].head, api.state.noteState[3].head]
 );
 api.state.beatmap = map;
 api.buildPoints();
