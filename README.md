@@ -108,7 +108,7 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
 2. 修改后运行测试，确保全绿：
 
    ```bash
-   node test/mrm-test.mjs   # 当前 54 项断言，无需安装依赖
+   node test/mrm-test.mjs   # 当前 61 项断言，无需安装依赖
    ```
 
 3. 提交 PR，说明变更动机与验证方式。
@@ -119,6 +119,34 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
 - 浏览器调试接口：`window.__maniaReplayMaster`（暴露 state / 判定匹配 / 渲染等函数）；
 - 测试基于 Node 内置 `vm` 模拟 DOM，可在无 tosu 环境下验证判定窗口、匹配、缓存与渲染逻辑；
 - 代码风格：2 空格缩进、保持现有模块内聚，避免引入全局变量与构建依赖。
+
+## 精确模式（本地辅助进程）
+
+插件本体无法读取磁盘回放或获取游戏按键，因此提供一个可选的本地辅助进程 `tools/mrm-helper.mjs`（纯 Node，单文件，无需安装依赖，内含 LZMA 解码器）：
+
+```bash
+# 默认读取 D:\Games\osu!\Data\r，监听 127.0.0.1:24051
+node "tools/mrm-helper.mjs" --osu "D:\Games\osu!" --port 24051
+
+# 如需自行指定谱面目录：
+node "tools/mrm-helper.mjs" --osu "E:\osu!"
+```
+
+工作方式：
+
+- 观看回放时：helper 按当前谱面 MD5 从 `Data\r` 找到对应 `.osr`，解出**逐帧按键位掩码**（精确列归属），插件自动对齐时间轴并直接计算判定；
+- 实时游玩时：helper 启动 `tools/key-hook.ps1`（Windows 低级键盘钩子，4K–8K 使用 stable 固定键位），把按键事件经 SSE 推送给插件，实现实时精确列渲染。
+
+插件设置中可配置 `helperUrl`（默认 `http://127.0.0.1:24051`）、`exactReplay`、`exactLive`；helper 未运行时插件自动回退到原有 hitError 推断模式。
+
+测试：
+
+```bash
+node test/mrm-test.mjs         # 61 项断言（无需 tosu / helper）
+node test/mrm-exact-test.mjs   # 端到端精确模式（需要 helper 与 Data\r，缺少映射索引时自动跳过）
+node test/mrm-live-check.mjs   # 实时按键通道自检（交互式，按提示按键）
+node test/mrm-live-monitor.mjs # 实机监控并生成诊断日志（需要 helper 与 tosu）
+```
 
 ## 致谢
 

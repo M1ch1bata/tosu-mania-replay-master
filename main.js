@@ -55,7 +55,10 @@ const settings = {
   backgroundColor: "#000000",
   backgroundOpacity: 0,
   renderScale: 100,
-  fpsLimit: 0
+  fpsLimit: 0,
+  helperUrl: "http://127.0.0.1:24051",
+  exactReplay: true,
+  exactLive: true
 };
 
 const state = {
@@ -94,6 +97,13 @@ const state = {
   hits: null,
   accuracy: 100,
   markedMiss: 0,
+  exactApplied: false,
+  exactFetching: false,
+  exactKey: "",
+  exactActions: null,
+  liveActive: false,
+  liveKey: "",
+  liveSource: null,
   lastHitsTotal: null,
   lastScore: 0,
   maniaScrollSpeed: 0,
@@ -462,6 +472,12 @@ function buildPoints() {
   state.points = pts;
   state.notePoints = notePoints;
   state.noteState = map && map.notes ? map.notes.map(() => ({ head: null, tail: null, extra: [] })) : [];
+  state.columnPoints = Array.from({ length: map ? map.keys : 0 }, () => []);
+  state.tailIndex = map && map.notes ? new Array(map.notes.length).fill(-1) : [];
+  for (let i = 0; i < pts.length; i++) {
+    state.columnPoints[pts[i].column].push(i);
+    if (pts[i].end) state.tailIndex[pts[i].note] = i;
+  }
   state.windowSig = "";
   resetJudgements();
 }
@@ -772,6 +788,222 @@ function applyCachedIfReady() {
   return applyRun(run);
 }
 
+function helperBase() {
+  const url = String(settings.helperUrl || "").trim().replace(/\/+$/, "");
+  return url || "";
+}
+
+function fitExactOffset(notes, keys, actions) {
+  const cols = Array.from({ length: keys }, () => []);
+  for (const n of notes) {
+    if (n.column >= 0 && n.column < keys) cols[n.column].push(n.time);
+  }
+  const dist = (arr, t) => {
+    if (!arr.length) return Infinity;
+    let lo = 0;
+    let hi = arr.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid] < t) lo = mid + 1;
+      else hi = mid;
+    }
+    let best = Math.abs(arr[lo] - t);
+    if (lo > 0) best = Math.min(best, Math.abs(arr[lo - 1] - t));
+    return best;
+  };
+  const sample = actions.filter((_, i) => i % 3 === 0);
+  const soft = (off) => {
+    let s = 0;
+    for (const a of sample) {
+      const d = dist(cols[a.column], a.time + off);
+      if (d <= 15) s += (15 - d) / 15;
+    }
+    return s;
+  };
+  const hard = (off) => {
+    let hits = 0;
+    for (const a of sample) if (dist(cols[a.column], a.time + off) <= 15) hits += 1;
+    return hits;
+  };
+  let bestOff = 0;
+  let bestScore = -1;
+  for (let off = -12000; off <= 12000; off += 25) {
+    const s = soft(off);
+    if (s > bestScore) {
+      bestScore = s;
+      bestOff = off;
+    }
+  }
+  const coarse = bestOff;
+  bestScore = -1;
+  for (let off = coarse - 40; off <= coarse + 40; off += 1) {
+    const s = hard(off) * 1000 + soft(off);
+    if (s > bestScore) {
+      bestScore = s;
+      bestOff = off;
+    }
+  }
+  return bestOff;
+}
+
+function nearestPoint(column, time, wantEnd, claimed, window) {
+  const list = state.columnPoints && state.columnPoints[column];
+  const pts = state.points;
+  if (!list || !pts) return -1;
+  let best = -1;
+  let bestDist = Infinity;
+  for (const i of list) {
+    const p = pts[i];
+    if (claimed ? claimed[i] : p.matched) continue;
+    if (!!p.end !== wantEnd) continue;
+    const dist = Math.abs(p.time - time);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = i;
+    }
+    if (p.time - time > window) break;
+  }
+  return best >= 0 && bestDist <= window ? best : -1;
+}
+
+function applyExactTimeline(actions, offset) {
+  const map = state.beatmap;
+  const pts = state.points;
+  if (!map || !pts || !pts.length || !actions || !actions.length) return false;
+  resetJudgements();
+  const w = state.windows && state.windows.length ? state.windows : localWindows();
+  const missW = w[w.length - 1];
+  const claimed = new Uint8Array(pts.length);
+  let lastT = 0;
+  for (const a of actions) {
+    const t = a.time + offset;
+    if (t > lastT) lastT = t;
+    const head = nearestPoint(a.column, t, false, claimed, missW);
+    if (head < 0) continue;
+    claimed[head] = 1;
+    const target = pts[head];
+    applyMatch(target, t - target.time);
+    if (map.notes[target.note] && map.notes[target.note].hold) {
+      const tailIdx = state.tailIndex ? state.tailIndex[target.note] : -1;
+      if (tailIdx >= 0 && !claimed[tailIdx]) {
+        const tail = pts[tailIdx];
+        const tailErr = a.endTime + offset - tail.time;
+        if (Math.abs(tailErr) <= missW) {
+          claimed[tailIdx] = 1;
+          applyMatch(tail, tailErr);
+        }
+      }
+    }
+  }
+  let misses = 0;
+  for (let i = 0; i < pts.length; i++) {
+    if (claimed[i]) continue;
+    const p = pts[i];
+    if (p.time > lastT + missW) continue;
+    const n = map.notes[p.note];
+    if (!n) continue;
+    if (!state.scoreV2 && n.hold && p.end) continue;
+    markPointMiss(p);
+    misses += 1;
+  }
+  const lastNote = map.notes.length ? map.notes[map.notes.length - 1] : null;
+  const complete = !!lastNote && lastT >= lastNote.endTime - 1000;
+  saveRun(complete);
+  state.markedMiss = misses;
+  state.searchFrom = pts.length;
+  state.sweepFrom = pts.length;
+  state.errorCount = state.statCount;
+  state.pendingApply = false;
+  state.cached = true;
+  state.cachedErrors = [];
+  state.cacheChecked = 0;
+  state.exactApplied = true;
+  return true;
+}
+
+function applyExactData() {
+  if (state.exactApplied || !state.exactActions || !state.beatmap || !state.points) return false;
+  if (state.gameState !== "play") return false;
+  const offset = fitExactOffset(state.beatmap.notes, state.beatmap.keys, state.exactActions);
+  return applyExactTimeline(state.exactActions, offset);
+}
+
+async function maybeExact() {
+  const base = helperBase();
+  if (!base || !settings.exactReplay) return;
+  if (state.exactApplied || state.exactFetching) return;
+  if (state.gameState !== "play" || !state.checksum || !state.beatmap || !state.points) return;
+  const key = `${state.checksum}.${state.beatmap.keys}`;
+  if (state.exactKey === key) {
+    applyExactData();
+    return;
+  }
+  state.exactFetching = true;
+  const token = state.loadToken;
+  let found = null;
+  try {
+    const res = await fetch(`${base}/replay?md5=${state.checksum}&keys=${state.beatmap.keys}`, { cache: "no-store" });
+    const data = await res.json();
+    if (data && data.found && Array.isArray(data.actions)) found = data.actions;
+  } catch {
+    found = null;
+  }
+  state.exactFetching = false;
+  if (token !== state.loadToken) return;
+  state.exactKey = key;
+  state.exactActions = found;
+  if (found) applyExactData();
+}
+
+function closeLive() {
+  if (state.liveSource) {
+    try {
+      state.liveSource.close();
+    } catch {
+    }
+  }
+  state.liveSource = null;
+  state.liveKey = "";
+  state.liveActive = false;
+}
+
+function applyLiveKey(column, t, down) {
+  const w = state.windows || localWindows();
+  if (!state.points || !w || !w.length) return;
+  const best = nearestPoint(column, t, !down, null, w[w.length - 1]);
+  if (best < 0) return;
+  applyMatch(state.points[best], t - state.points[best].time);
+}
+
+function ensureLive() {
+  if (!settings.exactLive || state.liveSource || state.exactApplied) return;
+  if (typeof EventSource === "undefined") return;
+  const base = helperBase();
+  if (!base || state.gameState !== "play" || !state.beatmap || !state.points) return;
+  const key = `${state.checksum}.${state.beatmap.keys}`;
+  if (state.liveKey === key) return;
+  state.liveKey = key;
+  const source = new EventSource(`${base}/live?keys=${state.beatmap.keys}`);
+  state.liveSource = source;
+  source.onmessage = (ev) => {
+    let msg = null;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    if (!msg || msg.type !== "key") return;
+    if (state.gameState !== "play" || state.exactApplied) return;
+    if (!state.liveActive) {
+      state.liveActive = true;
+      resetJudgements();
+    }
+    applyLiveKey(msg.column, renderTime(), !msg.down);
+  };
+  source.onerror = () => {
+  };
+}
+
 function parseListingNames(html) {
   const names = new Set();
   const re = /<a\s+href="([^"]+)"[^>]*>([^<]*)<\/a>/gi;
@@ -873,6 +1105,8 @@ async function ensureBeatmap() {
     buildPoints();
     updateWindows();
     applyCachedIfReady();
+    maybeExact();
+    ensureLive();
   } catch (err) {
     if (token !== state.loadToken) return;
     state.beatmap = null;
@@ -1245,6 +1479,9 @@ function statusText() {
     if (state.loadError) return `beatmap fetch failed: ${state.loadError} (retrying)`;
     return "loading beatmap...";
   }
+  if (state.exactApplied) return "exact: replay";
+  if (state.liveActive) return "exact: live";
+  if (helperBase() && (settings.exactReplay || settings.exactLive)) return "exact: waiting";
   return "";
 }
 
@@ -1347,6 +1584,11 @@ function handleGameStateChange(stateName) {
     state.pendingApply = true;
     state.lastHitsTotal = null;
     state.lastScore = 0;
+    state.exactApplied = false;
+    state.exactKey = "";
+    state.exactActions = null;
+    state.exactFetching = false;
+    closeLive();
     resetJudgements();
   } else if (stateName !== "play" && state.gameState === "play") {
     if (!state.cached && state.statCount > 0) {
@@ -1360,6 +1602,7 @@ function handleGameStateChange(stateName) {
     state.cachedErrors = null;
     state.pendingApply = false;
     state.runPrefix = [];
+    closeLive();
   }
   state.gameState = stateName;
 }
@@ -1441,6 +1684,8 @@ function onV2(data) {
   updateWindows();
   ensureBeatmap();
   applyCachedIfReady();
+  maybeExact();
+  ensureLive();
   if (state.gameState === "play" && !state.cached && state.statCount > 0 && performance.now() >= state.nextSaveAt) {
     state.nextSaveAt = performance.now() + 3000;
     saveRun(false);
@@ -1449,9 +1694,10 @@ function onV2(data) {
 
 function onPrecise(data) {
   if (!data) return;
+  if (state.exactApplied || state.liveActive) return;
   const arr = data.hitErrors;
   if (!Array.isArray(arr)) return;
-  if (state.gameState !== "play") {
+  if (state.gameState !== "play")   {
     if (!state.cached && state.errorCount !== 0) resetJudgements();
     return;
   }
@@ -1536,6 +1782,13 @@ window.__maniaReplayMaster = {
   loadRuns,
   applyRun,
   runStorageKey,
+  fitExactOffset,
+  applyExactTimeline,
+  applyExactData,
+  maybeExact,
+  applyLiveKey,
+  ensureLive,
+  closeLive,
   ensureBeatmap,
   fetchBeatmapText,
   onV2,
