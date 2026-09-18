@@ -198,5 +198,49 @@
         "description": "cap the redraw rate (e.g. 60) if the ingame overlay stutters",
         "options": [],
         "value": 0
+    },
+    {
+        "uniqueID": "helperUrl",
+        "type": "text",
+        "title": "Exact Mode Helper URL",
+        "description": "local helper used for exact replay / live key data; empty disables exact mode. only loopback hosts (127.0.0.1 / localhost) are accepted.",
+        "options": [],
+        "value": "http://127.0.0.1:24051"
+    },
+    {
+        "uniqueID": "helperToken",
+        "type": "text",
+        "title": "Exact Mode Helper Token",
+        "description": "optional shared secret; must match the helper's --token value",
+        "options": [],
+        "value": ""
+    },
+    {
+        "uniqueID": "analysisMode",
+        "type": "options",
+        "title": "Analysis Mode",
+        "description": "Auto: live key hook while playing, pre-rendered .osr while only watching. Live: real-time judgement from the key hook, never reads .osr. Replay: pre-render the .osr timeline, never uses the hook.",
+        "options": [
+            "Auto",
+            "Live",
+            "Replay"
+        ],
+        "value": "Auto"
+    },
+    {
+        "uniqueID": "exactReplay",
+        "type": "checkbox",
+        "title": "Exact Replay (helper)",
+        "description": "apply per-column .osr key actions only while watching a replay",
+        "options": [],
+        "value": true
+    },
+    {
+        "uniqueID": "exactLive",
+        "type": "checkbox",
+        "title": "Exact Live (key hook)",
+        "description": "use the helper key hook for live per-column actions while playing",
+        "options": [],
+        "value": true
     }
 ]

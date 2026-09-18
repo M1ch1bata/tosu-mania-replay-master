@@ -57,9 +57,16 @@ const settings = {
   renderScale: 100,
   fpsLimit: 0,
   helperUrl: "http://127.0.0.1:24051",
+  helperToken: "",
+  analysisMode: "Auto",
   exactReplay: true,
   exactLive: true
 };
+
+function analysisMode() {
+  const mode = String(settings.analysisMode || "Auto");
+  return mode === "Live" || mode === "Replay" ? mode : "Auto";
+}
 
 const state = {
   client: "stable",
@@ -101,9 +108,16 @@ const state = {
   exactFetching: false,
   exactKey: "",
   exactActions: null,
+  exactRetryAt: 0,
   liveActive: false,
+  liveReady: false,
+  liveAnchorHook: null,
+  liveAnchorSong: 0,
   liveKey: "",
   liveSource: null,
+  helperState: "off",
+  helperLayout: "",
+  helperHookError: "",
   lastHitsTotal: null,
   lastScore: 0,
   maniaScrollSpeed: 0,
@@ -119,7 +133,15 @@ const state = {
   cachedErrors: null,
   cacheChecked: 0,
   runPrefix: [],
-  nextSaveAt: 0
+  nextSaveAt: 0,
+  lastV2At: 0,
+  keyHints: [],
+  keyHintPressed: [false, false, false, false],
+  keyHintCounts: [0, 0, 0, 0],
+  keyHintSlotCount: 0,
+  keyHintExposed: [],
+  keyHintSeen: false,
+  keyHintLogged: false
 };
 
 const renderCache = {
@@ -375,7 +397,7 @@ function localWindows() {
       range(188, 173, 158)
     ];
   }
-  const rate = state.client === "lazer" ? state.modsRate || 1 : 1;
+  const rate = state.modsRate || 1;
   return w.map((v) => Math.floor(v * rate) + 0.5);
 }
 
@@ -491,6 +513,7 @@ function resetJudgements() {
   state.searchFrom = 0;
   state.sweepFrom = 0;
   state.backfillFloor = -Infinity;
+  state.keyHints.length = 0;
   const pts = state.points || [];
   for (const p of pts) {
     p.matched = false;
@@ -627,6 +650,114 @@ function matchPoint(p, e, near) {
   advanceSearchFrom(p.time, near);
 }
 
+function pushKeyHint(column, kind) {
+  state.keyHints.push({ column, kind, at: renderTime() });
+  if (state.keyHints.length > 128) state.keyHints.splice(0, state.keyHints.length - 128);
+}
+
+function updateKeyHints(keys) {
+  if (!keys || typeof keys !== "object") return;
+  let slots = null;
+  if (Array.isArray(keys)) slots = keys;
+  else if (Array.isArray(keys.maniaKeys)) slots = keys.maniaKeys;
+  else if (keys.k1 || keys.k2 || keys.m1 || keys.m2) slots = [keys.k1, keys.k2, keys.m1, keys.m2];
+  if (!slots || !slots.length) return;
+  if (Array.isArray(keys) || Array.isArray(keys.maniaKeys)) {
+    state.keyHintSlotCount = slots.length;
+    for (let i = 0; i < slots.length; i++) state.keyHintExposed[i] = true;
+  } else if (state.keyHintSlotCount === 0) {
+    state.keyHintSlotCount = 4;
+    state.keyHintExposed = [true, true, true, false];
+  }
+  while (state.keyHintPressed.length < slots.length) {
+    state.keyHintPressed.push(false);
+    state.keyHintCounts.push(0);
+  }
+  for (let i = 0; i < slots.length; i++) {
+    const btn = slots[i];
+    if (!btn || typeof btn !== "object") continue;
+    const pressed = !!btn.isPressed;
+    const count = num(btn.count, 0);
+    if (count > state.keyHintCounts[i]) {
+      const delta = Math.min(4, count - state.keyHintCounts[i]);
+      for (let d = 0; d < delta; d++) pushKeyHint(i, "press");
+      state.keyHintExposed[i] = true;
+      state.keyHintSeen = true;
+    } else if (pressed && !state.keyHintPressed[i]) {
+      pushKeyHint(i, "press");
+      state.keyHintExposed[i] = true;
+      state.keyHintSeen = true;
+    }
+    if (!pressed && state.keyHintPressed[i]) pushKeyHint(i, "release");
+    state.keyHintPressed[i] = pressed;
+    state.keyHintCounts[i] = count;
+  }
+  if (state.keyHintSeen && !state.keyHintLogged) {
+    state.keyHintLogged = true;
+    console.info(`[ManiaReplayMaster] tosu precise keys: column hints active (${state.keyHintSlotCount} slots)`);
+  }
+}
+
+function consumeError(e, pressTime) {
+  const map = state.beatmap;
+  const pts = state.points;
+  const w = state.windows;
+  if (!map || !pts || !w || !w.length) return;
+  const missW = w[w.length - 1];
+  const now = renderTime();
+  const implied = now - e;
+  while (state.keyHints.length) {
+    const hint = state.keyHints[0];
+    if (now - hint.at > 300) {
+      state.keyHints.shift();
+      continue;
+    }
+    const list = state.columnPoints[hint.column];
+    let best = -1;
+    let bestDist = Infinity;
+    const wantEnd = hint.kind === "release";
+    if (list) {
+      for (const i of list) {
+        const p = pts[i];
+        if (!!p.end !== wantEnd || p.matched) continue;
+        const dist = Math.abs(p.time - implied);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = i;
+        }
+      }
+    }
+    state.keyHints.shift();
+    if (best >= 0 && bestDist <= missW) {
+      matchPoint(pts[best], e, missW + 60);
+      return;
+    }
+  }
+  const candidates = [];
+  for (let c = 0; c < map.keys; c++) {
+    if (c < state.keyHintSlotCount && state.keyHintExposed[c]) continue;
+    const list = state.columnPoints[c];
+    if (!list) continue;
+    let best = -1;
+    let bestDist = Infinity;
+    for (const i of list) {
+      const p = pts[i];
+      if (p.matched || p.end) continue;
+      const dist = Math.abs(p.time - implied);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
+      }
+    }
+    if (best >= 0 && bestDist <= missW) candidates.push({ i: best, dist: bestDist });
+  }
+  if (candidates.length === 1) {
+    matchPoint(pts[candidates[0].i], e, missW + 60);
+    return;
+  }
+  processError(e, pressTime);
+}
+
 function hitsAvailable() {
   return !!state.hits && gameHitsTotal() > 0;
 }
@@ -693,6 +824,34 @@ function sweepMisses(t) {
 
 const runMemory = new Map();
 const RUN_VERSION = 4;
+const RUN_MEMORY_LIMIT = 60;
+
+function trimRunMemory() {
+  while (runMemory.size > RUN_MEMORY_LIMIT) {
+    const oldest = runMemory.keys().next().value;
+    if (oldest === undefined) break;
+    runMemory.delete(oldest);
+  }
+}
+
+function pruneStoredRuns() {
+  const keys = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith("mrm.run.")) keys.push(key);
+    }
+  } catch {
+    return;
+  }
+  const drop = Math.max(1, Math.ceil(keys.length / 2));
+  for (let i = 0; i < drop && i < keys.length; i++) {
+    try {
+      localStorage.removeItem(keys[i]);
+    } catch {
+    }
+  }
+}
 
 function runStorageKey() {
   if (!state.checksum || !state.beatmap) return "";
@@ -725,9 +884,15 @@ function saveRun(complete) {
   runs.unshift({ v: 1, g: RUN_VERSION, ts: Date.now(), complete: !!complete, matches });
   const trimmed = runs.slice(0, 3);
   runMemory.set(key, trimmed);
+  trimRunMemory();
   try {
     localStorage.setItem(key, JSON.stringify(trimmed));
   } catch {
+    pruneStoredRuns();
+    try {
+      localStorage.setItem(key, JSON.stringify(trimmed));
+    } catch {
+    }
   }
 }
 
@@ -779,7 +944,10 @@ function applyRun(run) {
 }
 
 function applyCachedIfReady() {
-  if (!state.pendingApply || !state.replayUi) return false;
+  if (!state.pendingApply || state.liveActive) return false;
+  const mode = analysisMode();
+  if (mode === "Live") return false;
+  if (mode !== "Replay" && !state.replayUi) return false;
   if (!state.beatmap || !state.points || !state.points.length) return false;
   if (state.statCount > 0) return false;
   const run = pickRun(state.runPrefix);
@@ -790,7 +958,23 @@ function applyCachedIfReady() {
 
 function helperBase() {
   const url = String(settings.helperUrl || "").trim().replace(/\/+$/, "");
-  return url || "";
+  if (!url) return "";
+  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(url) ? url : "";
+}
+
+function helperEndpoint(pathWithQuery) {
+  const base = helperBase();
+  if (!base) return "";
+  const token = String(settings.helperToken || "").trim();
+  if (!token) return `${base}${pathWithQuery}`;
+  return `${base}${pathWithQuery}${pathWithQuery.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+}
+
+function helperFetch(url, ms) {
+  if (typeof AbortController !== "function") return fetch(url, { cache: "no-store" });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { cache: "no-store", signal: controller.signal }).finally(() => clearTimeout(timer));
 }
 
 function fitExactOffset(notes, keys, actions) {
@@ -846,24 +1030,19 @@ function fitExactOffset(notes, keys, actions) {
   return bestOff;
 }
 
-function nearestPoint(column, time, wantEnd, claimed, window) {
+function lockPoint(column, time, wantEnd, claimed, window) {
   const list = state.columnPoints && state.columnPoints[column];
   const pts = state.points;
   if (!list || !pts) return -1;
-  let best = -1;
-  let bestDist = Infinity;
   for (const i of list) {
     const p = pts[i];
-    if (claimed ? claimed[i] : p.matched) continue;
     if (!!p.end !== wantEnd) continue;
-    const dist = Math.abs(p.time - time);
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = i;
-    }
-    if (p.time - time > window) break;
+    if (claimed ? claimed[i] : p.matched) continue;
+    if (p.time < time - window) continue;
+    if (p.time - time > window) return -1;
+    return i;
   }
-  return best >= 0 && bestDist <= window ? best : -1;
+  return -1;
 }
 
 function applyExactTimeline(actions, offset) {
@@ -878,7 +1057,7 @@ function applyExactTimeline(actions, offset) {
   for (const a of actions) {
     const t = a.time + offset;
     if (t > lastT) lastT = t;
-    const head = nearestPoint(a.column, t, false, claimed, missW);
+    const head = lockPoint(a.column, t, false, claimed, missW);
     if (head < 0) continue;
     claimed[head] = 1;
     const target = pts[head];
@@ -924,35 +1103,59 @@ function applyExactTimeline(actions, offset) {
 function applyExactData() {
   if (state.exactApplied || !state.exactActions || !state.beatmap || !state.points) return false;
   if (state.gameState !== "play") return false;
+  const mode = analysisMode();
+  if (mode === "Live") return false;
+  if (state.liveActive) return false;
+  if (mode === "Auto" && !exactReplayReady()) return false;
   const offset = fitExactOffset(state.beatmap.notes, state.beatmap.keys, state.exactActions);
   return applyExactTimeline(state.exactActions, offset);
+}
+
+function exactReplayReady() {
+  if (state.liveActive) return false;
+  const notes = state.beatmap && state.beatmap.notes;
+  const first = notes && notes.length ? notes[0].time : 0;
+  if (renderTime() < first + 1000) return false;
+  if (settings.exactLive && state.liveSource && state.liveSource.readyState === 1 && !state.liveReady) return false;
+  return true;
 }
 
 async function maybeExact() {
   const base = helperBase();
   if (!base || !settings.exactReplay) return;
+  if (analysisMode() === "Live") return;
   if (state.exactApplied || state.exactFetching) return;
-  if (state.gameState !== "play" || !state.checksum || !state.beatmap || !state.points) return;
+  if (state.gameState !== "play") return;
+  if (state.liveActive) return;
+  if (!state.checksum || !state.beatmap || !state.points) return;
   const key = `${state.checksum}.${state.beatmap.keys}`;
   if (state.exactKey === key) {
     applyExactData();
     return;
   }
+  if (performance.now() < state.exactRetryAt) return;
   state.exactFetching = true;
   const token = state.loadToken;
   let found = null;
+  let ok = false;
   try {
-    const res = await fetch(`${base}/replay?md5=${state.checksum}&keys=${state.beatmap.keys}`, { cache: "no-store" });
+    const res = await helperFetch(helperEndpoint(`/replay?md5=${state.checksum}&keys=${state.beatmap.keys}`), 3000);
     const data = await res.json();
     if (data && data.found && Array.isArray(data.actions)) found = data.actions;
+    ok = true;
   } catch {
-    found = null;
+    ok = false;
   }
   state.exactFetching = false;
   if (token !== state.loadToken) return;
-  state.exactKey = key;
-  state.exactActions = found;
-  if (found) applyExactData();
+  if (ok) state.helperState = "ready";
+  if (ok && found) {
+    state.exactKey = key;
+    state.exactActions = found;
+    applyExactData();
+  } else {
+    state.exactRetryAt = performance.now() + 5000;
+  }
 }
 
 function closeLive() {
@@ -965,26 +1168,75 @@ function closeLive() {
   state.liveSource = null;
   state.liveKey = "";
   state.liveActive = false;
+  state.liveReady = false;
+  state.liveAnchorHook = null;
+  state.liveAnchorSong = 0;
+  state.helperState = "off";
+}
+
+function clearExactState() {
+  state.exactApplied = false;
+  state.exactKey = "";
+  state.exactActions = null;
+  state.exactFetching = false;
+  state.exactRetryAt = 0;
+}
+
+function clearReplayRun() {
+  clearExactState();
+  state.cached = false;
+  state.cachedErrors = null;
+  state.cacheChecked = 0;
+  state.pendingApply = false;
+}
+
+function resetExactRun() {
+  clearReplayRun();
+  closeLive();
 }
 
 function applyLiveKey(column, t, down) {
   const w = state.windows || localWindows();
   if (!state.points || !w || !w.length) return;
-  const best = nearestPoint(column, t, !down, null, w[w.length - 1]);
+  const best = lockPoint(column, t, !down, null, w[w.length - 1]);
   if (best < 0) return;
   applyMatch(state.points[best], t - state.points[best].time);
 }
 
+function hookSongTime(hookT) {
+  const h = Number(hookT);
+  if (!Number.isFinite(h)) return renderTime();
+  const rate = clamp(state.modsRate || 1, 0.5, 2);
+  if (state.liveAnchorHook === null) {
+    state.liveAnchorHook = h;
+    state.liveAnchorSong = renderTime();
+    return state.liveAnchorSong;
+  }
+  const predicted = state.liveAnchorSong + (h - state.liveAnchorHook) * rate;
+  const measured = renderTime();
+  const drift = measured - predicted;
+  if (Math.abs(drift) > 400) {
+    state.liveAnchorHook = h;
+    state.liveAnchorSong = measured;
+    return measured;
+  }
+  if (Math.abs(drift) > 40) state.liveAnchorSong += drift * 0.02;
+  return predicted;
+}
+
 function ensureLive() {
-  if (!settings.exactLive || state.liveSource || state.exactApplied) return;
+  if (!settings.exactLive || state.liveSource) return;
+  if (analysisMode() === "Replay") return;
   if (typeof EventSource === "undefined") return;
   const base = helperBase();
   if (!base || state.gameState !== "play" || !state.beatmap || !state.points) return;
   const key = `${state.checksum}.${state.beatmap.keys}`;
   if (state.liveKey === key) return;
   state.liveKey = key;
-  const source = new EventSource(`${base}/live?keys=${state.beatmap.keys}`);
+  state.helperState = "connecting";
+  const source = new EventSource(helperEndpoint(`/live?keys=${state.beatmap.keys}`));
   state.liveSource = source;
+  let warned = false;
   source.onmessage = (ev) => {
     let msg = null;
     try {
@@ -992,15 +1244,33 @@ function ensureLive() {
     } catch {
       return;
     }
+    if (msg && msg.type === "hello") {
+      state.liveReady = true;
+      state.helperState = "ready";
+      state.helperLayout = String(msg.layout || "");
+      state.helperHookError = String(msg.error || "");
+      if (msg.hook) console.info(`[ManiaReplayMaster] hook layout: ${state.helperLayout} (${msg.from || "?"})`);
+      else console.warn(`[ManiaReplayMaster] helper hook unavailable: ${state.helperHookError || "unknown error"}`);
+      return;
+    }
     if (!msg || msg.type !== "key") return;
-    if (state.gameState !== "play" || state.exactApplied) return;
+    if (state.gameState !== "play") return;
+    if (analysisMode() === "Replay") return;
+    if (state.exactApplied) {
+      if (analysisMode() !== "Auto") return;
+      clearReplayRun();
+    }
     if (!state.liveActive) {
       state.liveActive = true;
       resetJudgements();
     }
-    applyLiveKey(msg.column, renderTime(), !msg.down);
+    applyLiveKey(msg.column, hookSongTime(msg.t), !!msg.down);
   };
   source.onerror = () => {
+    state.helperState = "error";
+    if (warned) return;
+    warned = true;
+    console.warn("[ManiaReplayMaster] helper stream error - start tools/mrm-helper.mjs (see README)");
   };
 }
 
@@ -1242,11 +1512,24 @@ function drawActionHold(ctx, col, y1, y2, h, opacity) {
   }
 }
 
-function unstableRate() {
-  const n = state.statCount;
+function unstableRate(t) {
+  let n = state.statCount;
+  let sum = state.errorSum;
+  let sq = state.errorSq;
+  if (t !== undefined && (state.cached || state.exactApplied) && state.points) {
+    n = 0;
+    sum = 0;
+    sq = 0;
+    for (const p of state.points) {
+      if (!p.matched || p.e === null || p.at > t) continue;
+      n += 1;
+      sum += p.e;
+      sq += p.e * p.e;
+    }
+  }
   if (n < 2) return 0;
-  const mean = state.errorSum / n;
-  const variance = Math.max(0, state.errorSq / n - mean * mean);
+  const mean = sum / n;
+  const variance = Math.max(0, sq / n - mean * mean);
   const ur = Math.sqrt(variance) * 10;
   return state.modsRate && state.modsRate !== 1 ? ur / state.modsRate : ur;
 }
@@ -1257,20 +1540,29 @@ function gameHitsTotal() {
   return num(h.geki, 0) + num(h["300"], 0) + num(h.katu, 0) + num(h["100"], 0) + num(h["50"], 0) + num(h["0"], 0);
 }
 
-function computedCounts() {
+function pointJudgedAt(p) {
+  if (!p) return Infinity;
+  return p.matched && p.e !== null ? p.at : p.time;
+}
+
+function computedCounts(t) {
   const counts = [0, 0, 0, 0, 0, 0];
   const notes = state.beatmap && state.beatmap.notes;
   const ns = state.noteState;
-  if (!notes || !ns) return counts;
+  const nps = state.notePoints;
+  if (!notes || !ns || !nps) return counts;
+  const visible = (p) => p && p.matched && (t === undefined || pointJudgedAt(p) <= t);
   for (let i = 0; i < notes.length; i++) {
     const s = ns[i];
     if (!s) continue;
+    const np = nps[i];
+    if (!np) continue;
     if (notes[i].hold && !state.scoreV2) {
-      if (s.head !== null) counts[s.head < 0 ? 5 : s.head] += 1;
+      if (s.head !== null && visible(np.head)) counts[s.head < 0 ? 5 : s.head] += 1;
       continue;
     }
-    if (s.head !== null) counts[s.head < 0 ? 5 : s.head] += 1;
-    if (notes[i].hold && s.tail !== null) counts[s.tail < 0 ? 5 : s.tail] += 1;
+    if (s.head !== null && visible(np.head)) counts[s.head < 0 ? 5 : s.head] += 1;
+    if (notes[i].hold && s.tail !== null && visible(np.tail)) counts[s.tail < 0 ? 5 : s.tail] += 1;
   }
   return counts;
 }
@@ -1286,7 +1578,7 @@ function countsAccuracy(counts) {
   return (sum / total) * 100;
 }
 
-function panelStats() {
+function panelStats(t) {
   const h = state.hits;
   if (h && gameHitsTotal() > 0) {
     return {
@@ -1294,12 +1586,12 @@ function panelStats() {
       accuracy: state.accuracy
     };
   }
-  const counts = computedCounts();
+  const counts = computedCounts(t);
   return { counts, accuracy: countsAccuracy(counts) };
 }
 
-function drawStats(ctx, opacity) {
-  const { counts, accuracy } = panelStats();
+function drawStats(ctx, opacity, t) {
+  const { counts, accuracy } = panelStats(t);
   const scale = clamp(num(settings.statsScale, 1.4), 0.5, 4);
   const squareW = 5 * scale;
   const squareH = 10 * scale;
@@ -1332,7 +1624,7 @@ function drawStats(ctx, opacity) {
   ctx.fillStyle = "rgba(255,255,255,0.92)";
   ctx.fillText(`${accuracy.toFixed(2)}%`, x + squareW + 4 * scale, y);
   y += rowH;
-  ctx.fillText(`UR ${unstableRate().toFixed(0)}`, x + squareW + 4 * scale, y);
+  ctx.fillText(`UR ${unstableRate(t).toFixed(0)}`, x + squareW + 4 * scale, y);
 }
 
 function effectiveTimeRange(hitPos) {
@@ -1421,7 +1713,7 @@ function renderScene(ctx, t) {
     }
   }
   ctx.globalAlpha = opacity;
-  if (settings.showStats) drawStats(ctx, opacity);
+  if (settings.showStats) drawStats(ctx, opacity, t);
   ctx.globalAlpha = 1;
 }
 
@@ -1480,8 +1772,12 @@ function statusText() {
     return "loading beatmap...";
   }
   if (state.exactApplied) return "exact: replay";
-  if (state.liveActive) return "exact: live";
-  if (helperBase() && (settings.exactReplay || settings.exactLive)) return "exact: waiting";
+  if (state.liveActive) return state.helperLayout ? `exact: live (${state.helperLayout})` : "exact: live";
+  if (helperBase() && (settings.exactReplay || settings.exactLive)) {
+    if (state.helperState === "error" || state.helperState === "off") return "exact: helper offline (run tools/mrm-helper.mjs)";
+    if (state.helperHookError) return `exact: hook unavailable (${state.helperHookError})`;
+    return "exact: waiting";
+  }
   return "";
 }
 
@@ -1493,6 +1789,9 @@ function frame() {
   lastFrameAt = nowMs;
 
   resize();
+  if (state.gameState === "play" && state.lastV2At && nowMs - state.lastV2At > 2500) {
+    handleGameStateChange("not_ready");
+  }
   const width = canvas.width;
   const height = canvas.height;
   const text = statusText();
@@ -1584,11 +1883,7 @@ function handleGameStateChange(stateName) {
     state.pendingApply = true;
     state.lastHitsTotal = null;
     state.lastScore = 0;
-    state.exactApplied = false;
-    state.exactKey = "";
-    state.exactActions = null;
-    state.exactFetching = false;
-    closeLive();
+    resetExactRun();
     resetJudgements();
   } else if (stateName !== "play" && state.gameState === "play") {
     if (!state.cached && state.statCount > 0) {
@@ -1645,6 +1940,7 @@ function applyPlayUpdate(play) {
     if (restarted) {
       state.runPrefix = [];
       state.pendingApply = false;
+      clearExactState();
       resetJudgements();
     }
     state.lastHitsTotal = totalHits;
@@ -1654,6 +1950,7 @@ function applyPlayUpdate(play) {
 
 function onV2(data) {
   if (!data) return;
+  state.lastV2At = performance.now();
   if (typeof data.client === "string" && data.client) state.client = data.client;
   if (data.settings) {
     if (typeof data.settings.replayUIVisible === "boolean") state.replayUi = data.settings.replayUIVisible;
@@ -1694,6 +1991,9 @@ function onV2(data) {
 
 function onPrecise(data) {
   if (!data) return;
+  const current = Number(data.currentTime);
+  if (Number.isFinite(current)) setTime(current);
+  updateKeyHints(data.keys);
   if (state.exactApplied || state.liveActive) return;
   const arr = data.hitErrors;
   if (!Array.isArray(arr)) return;
@@ -1728,13 +2028,13 @@ function onPrecise(data) {
     if (count > 4 || state.errorCount === 0 || state.timeSpeed > 1.25) {
       for (let i = state.errorCount; i < arr.length; i++) {
         state.runPrefix.push(arr[i]);
-        processError(arr[i], null);
+        consumeError(arr[i], null);
       }
     } else {
       const now = renderTime();
       for (let i = state.errorCount; i < arr.length; i++) {
         state.runPrefix.push(arr[i]);
-        processError(arr[i], now);
+        consumeError(arr[i], now);
       }
     }
     state.errorCount = arr.length;
@@ -1752,6 +2052,14 @@ function requestSettings(attempt) {
   const sent = sockets.send("/websocket/commands", `getSettings:${encodeURI(window.COUNTER_PATH || "")}`);
   if (!sent && attempt < 100) setTimeout(() => requestSettings(attempt + 1), 100);
 }
+
+function helperHeartbeat() {
+  setTimeout(helperHeartbeat, 25000);
+  if (!helperBase()) return;
+  if (!settings.exactReplay && !settings.exactLive) return;
+  helperFetch(helperEndpoint("/status"), 2000).catch(() => {});
+}
+helperHeartbeat();
 
 sockets.open("/websocket/v2", onV2, v2Filters);
 sockets.open("/websocket/v2/precise", onPrecise, null);
@@ -1787,12 +2095,23 @@ window.__maniaReplayMaster = {
   applyExactData,
   maybeExact,
   applyLiveKey,
+  hookSongTime,
   ensureLive,
   closeLive,
+  resetExactRun,
+  clearExactState,
+  clearReplayRun,
+  exactReplayReady,
+  analysisMode,
+  lockPoint,
+  helperBase,
+  helperEndpoint,
   ensureBeatmap,
   fetchBeatmapText,
   onV2,
   onPrecise,
+  updateKeyHints,
+  consumeError,
   renderTime,
   setTime,
   renderScene,

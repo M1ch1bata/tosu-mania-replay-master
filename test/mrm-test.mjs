@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import path from "node:path";
 import vm from "node:vm";
+import { fileURLToPath } from "node:url";
 
-const code = fs.readFileSync("D:\\Download\\tosu-windows-v4.20.0\\static\\Mania Replay Master\\main.js", "utf8");
+const code = fs.readFileSync(path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), "main.js"), "utf8");
 
 class E {
   constructor() {
@@ -45,6 +47,12 @@ const doc = {
 
 class WS { constructor(u) { this.url = u; this.readyState = 1; this.sent = []; } send(d) { this.sent.push(d); } close() {} }
 
+const eventSources = [];
+class FakeEventSource {
+  constructor(url) { this.url = url; this.readyState = 1; this.onmessage = null; this.onerror = null; eventSources.push(this); }
+  close() { this.readyState = 2; }
+}
+
 const clock = { now: 0 };
 const fakePerformance = { now: () => clock.now };
 const storage = new Map();
@@ -54,6 +62,7 @@ const sb = {
   requestAnimationFrame: () => 0, cancelAnimationFrame: () => {},
   performance: fakePerformance,
   WebSocket: WS,
+  EventSource: FakeEventSource,
   localStorage: {
     getItem: (k) => (storage.has(k) ? storage.get(k) : null),
     setItem: (k, v) => storage.set(k, String(v)),
@@ -98,7 +107,13 @@ api.state.client = "lazer";
 api.state.scoreV2 = false;
 api.state.classicMod = false;
 api.state.modsRate = 1.5;
-ok("lazer original OD8.5 DT", close(api.localWindows(), [23.5, 57.5, 107.5, 152.5, 188.5, 243.5]), api.localWindows());
+ok("lazer original OD8.5 DT scales windows with rate", close(api.localWindows(), [23.5, 57.5, 107.5, 152.5, 188.5, 243.5]), api.localWindows());
+
+api.state.client = "stable";
+api.state.scoreV2 = false;
+api.state.classicMod = true;
+api.state.modsRate = 1.5;
+ok("stable v1 OD8.5 DT scales windows with rate", close(api.localWindows(), [24.5, 57.5, 107.5, 152.5, 188.5, 243.5]), api.localWindows());
 
 api.state.client = "lazer";
 api.state.classicMod = true;
@@ -290,6 +305,308 @@ storage.delete(key);
 ok("in-memory fallback survives storage loss", api.loadRuns().length === 1, api.loadRuns().length);
 storage.set(key, JSON.stringify([{ v: 1, g: 1, matches: [[0, -5]] }]));
 ok("stale run cache discarded", api.loadRuns().length === 0, api.loadRuns().length);
+
+console.log("== replay stats timeline ==");
+api.state.hits = null;
+api.state.cached = false;
+api.state.exactApplied = false;
+api.applyRun(runs[0]);
+ok("cached replay stats start at zero", api.panelStats(0).counts.every((c) => c === 0), api.panelStats(0).counts);
+ok("cached replay stats count after note time", api.panelStats(1001).counts[0] === 2, api.panelStats(1001).counts);
+ok("cached replay UR zero before first hits", api.unstableRate(999) === 0, api.unstableRate(999));
+ok("cached replay stats complete at end", api.panelStats(5000).counts[0] === 2 && api.panelStats(5000).counts[5] === 2, api.panelStats(5000).counts);
+
+console.log("== exact replay vs live input priority ==");
+api.state.gameState = "play";
+api.state.beatmap = map;
+api.state.csConverted = 4;
+api.state.mapMode = "mania";
+api.state.hitWindow = null;
+api.updateWindows();
+api.buildPoints();
+api.resetExactRun();
+api.state.cached = false;
+api.state.exactActions = [{ column: 0, time: 1000, endTime: 1000 }];
+api.state.liveActive = true;
+ok("old .osr ignored once live input seen", api.applyExactData() === false && api.state.exactApplied === false, api.state.exactApplied);
+api.state.liveActive = false;
+ok("old .osr applies when live channel stays silent", api.applyExactData() === true && api.state.exactApplied === true, api.state.exactApplied);
+api.resetExactRun();
+api.state.cached = false;
+
+console.log("== analysis modes ==");
+api.state.liveActive = false;
+api.state.cached = false;
+api.state.exactApplied = false;
+api.state.exactActions = [{ column: 0, time: 1000, endTime: 1000 }];
+api.settings.analysisMode = "Live";
+ok("Live mode never pre-renders .osr", api.applyExactData() === false && api.state.exactApplied === false, api.state.exactApplied);
+api.settings.analysisMode = "Replay";
+ok("Replay mode pre-renders .osr", api.applyExactData() === true && api.state.exactApplied === true, api.state.exactApplied);
+api.settings.analysisMode = "Auto";
+api.resetExactRun();
+api.state.cached = false;
+
+console.log("== live note lock matching ==");
+const denseMap = api.buildManiaNotes(
+  api.parseOsu(
+    [
+      "osu file format v14",
+      "",
+      "[General]",
+      "Mode: 3",
+      "",
+      "[Difficulty]",
+      "CircleSize:4",
+      "OverallDifficulty:8.5",
+      "",
+      "[TimingPoints]",
+      "0,500,4,2,0,100,1,0",
+      "",
+      "[HitObjects]",
+      "64,192,1000,1,0,0:0:0:0:",
+      "64,192,1050,1,0,0:0:0:0:"
+    ].join("\n")
+  ),
+  4
+);
+api.state.client = "stable";
+api.state.scoreV2 = false;
+api.state.modsRate = 1;
+api.state.odConverted = 8.5;
+api.state.hitWindow = null;
+api.state.beatmap = denseMap;
+api.state.csConverted = 4;
+api.state.mapMode = "mania";
+api.updateWindows();
+api.buildPoints();
+api.applyLiveKey(0, 1080, true);
+ok("press hits earliest locked note, not nearest", api.state.noteState[0].head === 3 && api.state.noteState[1].head === null, [api.state.noteState[0].head, api.state.noteState[1].head]);
+api.applyLiveKey(0, 1100, true);
+ok("next press hits the following note", api.state.noteState[1].head === 2, api.state.noteState[1].head);
+
+console.log("== live chord per-column ==");
+const chordMap = api.buildManiaNotes(
+  api.parseOsu(
+    [
+      "osu file format v14",
+      "",
+      "[General]",
+      "Mode: 3",
+      "",
+      "[Difficulty]",
+      "CircleSize:4",
+      "OverallDifficulty:8.5",
+      "",
+      "[TimingPoints]",
+      "0,500,4,2,0,100,1,0",
+      "",
+      "[HitObjects]",
+      "64,192,1000,1,0,0:0:0:0:",
+      "192,192,1000,1,0,0:0:0:0:",
+      "320,192,1000,1,0,0:0:0:0:",
+      "448,192,1000,1,0,0:0:0:0:"
+    ].join("\n")
+  ),
+  4
+);
+api.state.beatmap = chordMap;
+api.state.points = null;
+api.buildPoints();
+api.applyLiveKey(0, 995, true);
+api.applyLiveKey(1, 1002, true);
+api.applyLiveKey(2, 1000, true);
+api.applyLiveKey(3, 998, true);
+ok("chord maps every column to its own note", api.state.noteState.every((s) => s.head === 0), api.state.noteState.map((s) => s.head));
+
+console.log("== precise clock & hook timing ==");
+api.state.liveActive = true;
+sb.__advance(50);
+api.onPrecise({ currentTime: 12345, hitErrors: [] });
+ok("precise currentTime drives the live clock", Math.abs(api.renderTime() - 12345) < 20, api.renderTime());
+api.state.liveActive = false;
+api.state.liveAnchorHook = null;
+api.state.modsRate = 1;
+const anchorA = api.hookSongTime(5000);
+const anchorB = api.hookSongTime(5010);
+ok("hook clock maps 1:1 at nomod", Math.abs(anchorB - anchorA - 10) < 1e-6, [anchorA, anchorB]);
+api.state.liveAnchorHook = null;
+api.state.modsRate = 1.5;
+const rateA = api.hookSongTime(6000);
+const rateB = api.hookSongTime(6010);
+ok("hook clock scales with rate", Math.abs(rateB - rateA - 15) < 1e-6, [rateA, rateB]);
+api.state.modsRate = 1;
+
+console.log("== live SSE chord attribution ==");
+const sseMap = api.buildManiaNotes(
+  api.parseOsu(
+    [
+      "osu file format v14",
+      "",
+      "[General]",
+      "Mode: 3",
+      "",
+      "[Difficulty]",
+      "CircleSize:4",
+      "OverallDifficulty:8.5",
+      "",
+      "[TimingPoints]",
+      "0,500,4,2,0,100,1,0",
+      "",
+      "[HitObjects]",
+      "64,192,1000,1,0,0:0:0:0:",
+      "192,192,1000,1,0,0:0:0:0:"
+    ].join("\n")
+  ),
+  4
+);
+api.state.client = "stable";
+api.state.scoreV2 = false;
+api.state.modsRate = 1;
+api.state.odConverted = 8.5;
+api.state.hitWindow = null;
+api.state.beatmap = sseMap;
+api.state.csConverted = 4;
+api.state.mapMode = "mania";
+api.state.checksum = "sse-map";
+api.state.gameState = "play";
+api.updateWindows();
+api.state.points = null;
+api.buildPoints();
+api.state.liveSource = null;
+api.state.liveKey = "";
+api.state.liveActive = false;
+api.state.liveReady = false;
+api.state.liveAnchorHook = null;
+api.state.exactApplied = false;
+api.settings.analysisMode = "Auto";
+api.setTime(1000);
+api.ensureLive();
+const sse = eventSources[eventSources.length - 1];
+sse.onmessage({ data: JSON.stringify({ type: "hello", hook: true, layout: "A S ; '" }) });
+ok("helper hello reports ready + layout", api.state.helperState === "ready" && api.state.helperLayout === "A S ; '", [api.state.helperState, api.state.helperLayout]);
+sse.onmessage({ data: JSON.stringify({ type: "key", down: true, column: 1, t: 5000 }) });
+ok("SSE key down hits its own column head", api.state.noteState[1].head === 0 && api.state.noteState[0].head === null, api.state.noteState.map((s) => s.head));
+sse.onmessage({ data: JSON.stringify({ type: "key", down: false, column: 1, t: 5100 }) });
+ok("SSE key up does not re-judge a tap", api.state.noteState[1].head === 0 && api.state.noteState[0].head === null, api.state.noteState.map((s) => s.head));
+api.sweepMisses(1300);
+ok("unpressed column becomes MISS", api.state.noteState[0].head === -1 && api.state.noteState[1].head === 0, api.state.noteState.map((s) => s.head));
+api.closeLive();
+api.state.liveSource = null;
+
+console.log("== live LN head on down / tail on up ==");
+const lnMap = api.buildManiaNotes(
+  api.parseOsu(
+    [
+      "osu file format v14",
+      "",
+      "[General]",
+      "Mode: 3",
+      "",
+      "[Difficulty]",
+      "CircleSize:4",
+      "OverallDifficulty:8.5",
+      "",
+      "[TimingPoints]",
+      "0,500,4,2,0,100,1,0",
+      "",
+      "[HitObjects]",
+      "64,192,1000,128,0,1500:0:0:0:0:"
+    ].join("\n")
+  ),
+  4
+);
+api.state.beatmap = lnMap;
+api.state.csConverted = 4;
+api.state.checksum = "sse-ln";
+api.updateWindows();
+api.state.points = null;
+api.buildPoints();
+api.state.liveKey = "";
+api.state.liveActive = false;
+api.state.liveReady = false;
+api.state.liveAnchorHook = null;
+api.setTime(1000);
+api.ensureLive();
+const sseLn = eventSources[eventSources.length - 1];
+sseLn.onmessage({ data: JSON.stringify({ type: "hello", hook: true, layout: "A S ; '" }) });
+sseLn.onmessage({ data: JSON.stringify({ type: "key", down: true, column: 0, t: 5000 }) });
+ok("LN head judged on key down", api.state.noteState[0].head === 0, api.state.noteState.map((s) => s.head));
+sseLn.onmessage({ data: JSON.stringify({ type: "key", down: false, column: 0, t: 5500 }) });
+ok("LN tail judged on key up", api.state.noteState[0].tail === 0, api.state.noteState.map((s) => s.tail));
+api.closeLive();
+api.state.liveSource = null;
+
+console.log("== precise key hints (no helper) ==");
+function hintSetup(objects, keys = 4) {
+  const map = api.buildManiaNotes(
+    api.parseOsu(
+      [
+        "osu file format v14",
+        "",
+        "[General]",
+        "Mode: 3",
+        "",
+        "[Difficulty]",
+        `CircleSize:${keys}`,
+        "OverallDifficulty:8.5",
+        "",
+        "[TimingPoints]",
+        "0,500,4,2,0,100,1,0",
+        "",
+        "[HitObjects]",
+        ...objects
+      ].join("\n")
+    ),
+    keys
+  );
+  api.state.client = "stable";
+  api.state.scoreV2 = false;
+  api.state.modsRate = 1;
+  api.state.odConverted = 8.5;
+  api.state.hitWindow = null;
+  api.state.beatmap = map;
+  api.state.csConverted = 4;
+  api.state.mapMode = "mania";
+  api.state.checksum = "hint-map";
+  api.state.gameState = "play";
+  api.updateWindows();
+  api.state.points = null;
+  api.buildPoints();
+  api.state.hits = null;
+  api.state.cached = false;
+  api.state.exactApplied = false;
+  api.state.liveActive = false;
+  api.state.errorCount = 0;
+  api.state.runPrefix = [];
+  api.state.keyHints.length = 0;
+  api.state.keyHintPressed = [false, false, false, false];
+  api.state.keyHintCounts = [0, 0, 0, 0];
+  api.state.keyHintSlotCount = 0;
+  api.state.keyHintExposed = [];
+  api.setTime(1000);
+  return map;
+}
+function hintKeys(pressed) {
+  const s = [0, 1, 2, 3].map((i) => ({ isPressed: pressed === i, count: 0 }));
+  return { k1: s[0], k2: s[1], m1: s[2], m2: s[3] };
+}
+hintSetup(["64,192,1000,1,0,0:0:0:0:", "192,192,1000,1,0,0:0:0:0:"]);
+api.onPrecise({ currentTime: 1000, keys: hintKeys(1), hitErrors: [] });
+api.onPrecise({ currentTime: 1000, keys: hintKeys(1), hitErrors: [8] });
+ok("key hint attributes hit to pressed column", api.state.noteState[1].head === 0 && api.state.noteState[0].head === null, api.state.noteState.map((s) => s.head));
+hintSetup(["64,192,1000,1,0,0:0:0:0:", "448,192,1000,1,0,0:0:0:0:"]);
+api.onPrecise({ currentTime: 1000, keys: hintKeys(-1), hitErrors: [5] });
+ok("unexposed column matched by elimination", api.state.noteState[1].head === 0 && api.state.noteState[0].head === null, api.state.noteState.map((s) => s.head));
+hintSetup(["64,192,1000,1,0,0:0:0:0:", "448,192,1000,1,0,0:0:0:0:"]);
+api.onPrecise({ currentTime: 1000, keys: hintKeys(0), hitErrors: [] });
+api.onPrecise({ currentTime: 1000, keys: hintKeys(0), hitErrors: [3, 7] });
+ok("chord pairs hint + elimination", api.state.noteState[0].head === 0 && api.state.noteState[1].head === 0, api.state.noteState.map((s) => s.head));
+hintSetup(["160,192,1000,1,0,0:0:0:0:", "470,192,1000,1,0,0:0:0:0:"], 7);
+const slots7 = [0, 1, 2, 3, 4, 5, 6].map((i) => ({ isPressed: i === 6, count: 0 }));
+api.onPrecise({ currentTime: 1000, keys: { maniaKeys: slots7 }, hitErrors: [] });
+api.onPrecise({ currentTime: 1000, keys: { maniaKeys: slots7 }, hitErrors: [4] });
+ok("full column array unlocks multi-key attribution", api.state.noteState[1].head === 0 && api.state.noteState[0].head === null, api.state.noteState.map((s) => s.head));
 
 console.log("== retry reset ==");
 api.state.gameState = "play";

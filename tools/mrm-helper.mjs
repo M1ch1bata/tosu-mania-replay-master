@@ -1,17 +1,16 @@
 // MRM Helper - local companion for Mania Replay Master
 // Reads osu! Data\r replays (exact per-column key actions) and streams live key events.
 // No npm dependencies. Usage:
-//   node mrm-helper.mjs [--osu "D:\Games\osu!"] [--port 24051]
-// Endpoints:
-//   GET /status                      -> { ok, osuDir, replays }
-//   GET /replay?md5=<beatmapMd5>     -> { found, actions, mods, counts, rate, ... }
-//   GET /live?keys=4&client=stable   -> SSE stream of key events (spawns key-hook.ps1)
+//   node mrm-helper.mjs [--osu "D:\Games\osu!"] [--port 24051] [--token <secret>]
+//                       [--exit-idle 600] [--watch-process "osu!,tosu"]
+// --exit-idle N: exit automatically after N seconds without requests/SSE clients (0 = never).
+// --watch-process a,b: once all of them have been seen running, exit as soon as any disappears.
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -21,8 +20,109 @@ function argValue(name, fallback) {
 }
 
 const port = Number(argValue("port", 24051));
-const osuDir = argValue("osu", "D:\\Games\\osu!");
-const replayDir = path.join(osuDir, "Data", "r");
+const osuDirOverride = String(argValue("osu", "") || "").trim();
+const token = String(argValue("token", "") || "");
+const exitIdleSec = Math.max(0, Number(argValue("exit-idle", 0)) || 0);
+const watchProcesses = String(argValue("watch-process", "") || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+let resolvedOsuDir = "";
+
+function looksLikeOsuDir(dir) {
+  if (!dir) return false;
+  try {
+    if (!fs.existsSync(dir)) return false;
+    if (fs.existsSync(path.join(dir, "Data", "r"))) return true;
+    if (fs.existsSync(path.join(dir, "osu!.exe"))) return true;
+    if (fs.existsSync(path.join(dir, "replays"))) return true;
+  } catch {
+  }
+  return false;
+}
+
+function detectOsuDir() {
+  const candidates = [];
+  if (process.env.TOSU_OSU_PATH) candidates.push(process.env.TOSU_OSU_PATH);
+
+  try {
+    const tosuEnv = path.join(path.resolve(__dirname, "..", "..", ".."), "tosu.env");
+    if (fs.existsSync(tosuEnv)) {
+      const text = fs.readFileSync(tosuEnv, "utf8");
+      const m = /^\s*TOSU_OSU_PATH\s*=\s*(.+?)\s*$/m.exec(text);
+      if (m) candidates.push(m[1].replace(/^["']|["']$/g, ""));
+    }
+  } catch {
+  }
+
+  try {
+    const out = execFileSync(
+      "powershell",
+      ["-NoProfile", "-Command", "(Get-Process -Name 'osu!' -ErrorAction SilentlyContinue | Select-Object -First 1).Path"],
+      { encoding: "utf8", windowsHide: true, timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }
+    );
+    if (out && out.trim()) candidates.push(path.dirname(out.trim()));
+  } catch {
+  }
+
+  for (const key of [
+    "HKCR\\osu\\shell\\open\\command",
+    "HKCU\\Software\\Classes\\osu\\shell\\open\\command",
+    "HKCR\\osu!\\shell\\open\\command",
+    "HKCU\\Software\\Classes\\osu!\\shell\\open\\command"
+  ]) {
+    try {
+      const out = execFileSync("reg", ["query", key, "/ve"], { encoding: "utf8", windowsHide: true, timeout: 5000, stdio: ["ignore", "pipe", "ignore"] });
+      const m = /REG_SZ\s+(.+)$/m.exec(out);
+      if (!m) continue;
+      const exe = /^"?([^"]+?\.exe)/i.exec(m[1].trim());
+      if (exe) candidates.push(path.dirname(exe[1]));
+    } catch {
+    }
+  }
+
+  if (process.env.LOCALAPPDATA) candidates.push(path.join(process.env.LOCALAPPDATA, "osu!"));
+  if (process.env.APPDATA) candidates.push(path.join(process.env.APPDATA, "osu!"));
+
+  for (const candidate of candidates) {
+    if (looksLikeOsuDir(candidate)) return candidate;
+  }
+  return "";
+}
+
+function currentOsuDir() {
+  if (osuDirOverride) return osuDirOverride;
+  if (!resolvedOsuDir) resolvedOsuDir = detectOsuDir();
+  return resolvedOsuDir;
+}
+
+function currentReplayDir() {
+  const dir = currentOsuDir();
+  if (!dir) return "";
+  const stable = path.join(dir, "Data", "r");
+  if (fs.existsSync(stable)) return stable;
+  const lazer = path.join(dir, "replays");
+  if (fs.existsSync(lazer)) return lazer;
+  return stable;
+}
+
+const ORIGIN_RE = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
+
+function corsFor(req) {
+  const origin = String(req.headers.origin || "");
+  if (origin && !ORIGIN_RE.test(origin)) return null;
+  return {
+    "Access-Control-Allow-Origin": origin || "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    Vary: "Origin"
+  };
+}
+
+function tokenOk(url) {
+  if (!token) return true;
+  return url.searchParams.get("token") === token;
+}
 
 // ---------- osr parsing ----------
 const lzmaCode = fs.readFileSync(path.join(__dirname, "lzma_worker.js"), "utf8");
@@ -120,9 +220,11 @@ function extractActions(text, keys, pressOffset = 0) {
 const osrCache = new Map();
 
 function listReplays() {
+  const dir = currentReplayDir();
+  if (!dir) return [];
   let names = [];
   try {
-    names = fs.readdirSync(replayDir).filter((f) => f.endsWith(".osr"));
+    names = fs.readdirSync(dir).filter((f) => f.endsWith(".osr"));
   } catch {
     return [];
   }
@@ -132,11 +234,13 @@ function listReplays() {
 function findReplayFile(md5) {
   const target = String(md5 || "").toLowerCase();
   if (!/^[0-9a-f]{32}$/.test(target)) return "";
+  const dir = currentReplayDir();
+  if (!dir) return "";
   let best = "";
   let bestMtime = -1;
   for (const name of listReplays()) {
     if (!name.toLowerCase().startsWith(target)) continue;
-    const full = path.join(replayDir, name);
+    const full = path.join(dir, name);
     try {
       const mtime = fs.statSync(full).mtimeMs;
       if (mtime > bestMtime) {
@@ -209,15 +313,17 @@ const STABLE_LAYOUTS = {
 
 let cfgFiles = null;
 function cfgCandidates() {
-  if (cfgFiles) return cfgFiles;
+  if (cfgFiles && cfgFiles.length) return cfgFiles;
+  const dir = currentOsuDir();
+  if (!dir) return [];
   let names = [];
   try {
-    names = fs.readdirSync(osuDir).filter((f) => /^osu!.*\.cfg$/i.test(f));
+    names = fs.readdirSync(dir).filter((f) => /^osu!.*\.cfg$/i.test(f));
   } catch {
     names = [];
   }
   names.sort((a, b) => (a.toLowerCase() === "osu!.cfg" ? 1 : b.toLowerCase() === "osu!.cfg" ? -1 : a.localeCompare(b)));
-  cfgFiles = names.map((n) => path.join(osuDir, n));
+  cfgFiles = names.map((n) => path.join(dir, n));
   return cfgFiles;
 }
 
@@ -258,6 +364,55 @@ function layoutFor(keys) {
 
 let hookProc = null;
 const sseClients = new Set();
+let hookIdleTimer = null;
+const HOOK_IDLE_MS = 10000;
+let idleExitTimer = null;
+
+function markActivity() {
+  if (!exitIdleSec) return;
+  if (idleExitTimer) clearTimeout(idleExitTimer);
+  idleExitTimer = setTimeout(() => {
+    idleExitTimer = null;
+    if (sseClients.size > 0) return;
+    console.log(`[mrm-helper] idle for ${exitIdleSec}s, exiting`);
+    shutdown();
+  }, exitIdleSec * 1000);
+}
+
+let watchArmed = false;
+
+function isProcessRunning(name) {
+  return new Promise((resolve) => {
+    execFile("tasklist", ["/FI", `IMAGENAME eq ${name}.exe`, "/NH"], { windowsHide: true }, (err, stdout) => {
+      if (err) return resolve(true);
+      resolve(String(stdout).toLowerCase().includes(`${name.toLowerCase()}.exe`));
+    });
+  });
+}
+
+async function watchTick() {
+  let allRunning = true;
+  for (const name of watchProcesses) {
+    if (!(await isProcessRunning(name))) {
+      allRunning = false;
+      break;
+    }
+  }
+  if (allRunning) {
+    watchArmed = true;
+    return;
+  }
+  if (watchArmed) {
+    console.log(`[mrm-helper] watched process exited (${watchProcesses.join(", ")}), exiting`);
+    shutdown();
+  }
+}
+
+function startProcessWatch() {
+  if (!watchProcesses.length) return;
+  watchTick();
+  setInterval(watchTick, 15000).unref();
+}
 
 function stopHook() {
   if (!hookProc) return;
@@ -268,9 +423,25 @@ function stopHook() {
   hookProc = null;
 }
 
+function cancelHookIdle() {
+  if (hookIdleTimer) {
+    clearTimeout(hookIdleTimer);
+    hookIdleTimer = null;
+  }
+}
+
+function scheduleHookIdle() {
+  cancelHookIdle();
+  hookIdleTimer = setTimeout(() => {
+    hookIdleTimer = null;
+    if (sseClients.size === 0) stopHook();
+  }, HOOK_IDLE_MS);
+}
+
 function ensureHook(keys) {
   const layout = layoutFor(keys);
   if (!layout) return { ok: false, error: `unsupported key count: ${keys}` };
+  cancelHookIdle();
   const spec = layout.vks.map((vk, col) => `${vk}:${col}`).join(",");
   const info = { ok: true, layout: layout.names.join(" "), from: layout.from };
   if (hookProc && hookProc.spec === spec) return info;
@@ -319,11 +490,19 @@ function broadcast(event) {
 
 // ---------- http server ----------
 const server = http.createServer((req, res) => {
+  markActivity();
   const u = new URL(req.url, `http://127.0.0.1:${port}`);
-  const cors = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "*"
-  };
+  const cors = corsFor(req);
+  if (!cors) {
+    res.writeHead(403, { "Content-Type": "text/plain" });
+    res.end("forbidden origin");
+    return;
+  }
+  if (!tokenOk(u)) {
+    res.writeHead(403, { ...cors, "Content-Type": "text/plain" });
+    res.end("forbidden token");
+    return;
+  }
   if (req.method === "OPTIONS") {
     res.writeHead(204, cors);
     res.end();
@@ -331,7 +510,7 @@ const server = http.createServer((req, res) => {
   }
   if (u.pathname === "/status") {
     res.writeHead(200, { ...cors, "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, osuDir, replayDir, replays: listReplays().length, hook: !!hookProc }));
+    res.end(JSON.stringify({ ok: true, osuDir: currentOsuDir(), replayDir: currentReplayDir(), replays: listReplays().length, hook: !!hookProc }));
     return;
   }
   if (u.pathname === "/replay") {
@@ -378,7 +557,12 @@ const server = http.createServer((req, res) => {
     });
     res.write(`data: ${JSON.stringify({ type: "hello", keys, hook: info.ok, error: info.error || "", layout: info.layout || "", from: info.from || "" })}\n\n`);
     sseClients.add(res);
-    req.on("close", () => sseClients.delete(res));
+    cancelHookIdle();
+    req.on("close", () => {
+      sseClients.delete(res);
+      if (sseClients.size === 0) scheduleHookIdle();
+      markActivity();
+    });
     return;
   }
   res.writeHead(404, cors);
@@ -387,7 +571,12 @@ const server = http.createServer((req, res) => {
 
 server.listen(port, "127.0.0.1", () => {
   console.log(`[mrm-helper] listening on http://127.0.0.1:${port}`);
-  console.log(`[mrm-helper] osu dir: ${osuDir} (replays: ${listReplays().length})`);
+  const detected = currentOsuDir();
+  console.log(`[mrm-helper] osu dir: ${detected || "not found yet (start osu! or pass --osu <path>)"} (replays: ${listReplays().length})`);
+  if (exitIdleSec > 0) console.log(`[mrm-helper] will exit after ${exitIdleSec}s without requests`);
+  if (watchProcesses.length) console.log(`[mrm-helper] will exit when these processes are gone: ${watchProcesses.join(", ")}`);
+  startProcessWatch();
+  markActivity();
 });
 
 function shutdown() {

@@ -5,6 +5,8 @@
 
 > A real-time mania replay & judgement overlay for tosu, inspired by Mania-Replay-Master.
 
+> **本目录是代码审查后的修复版本（v0.5.1，基于上游 0.5.0）**：修复清单见 [FIXES.md](FIXES.md)，更新说明见 [中文](CHANGELOG.zh.md) / [English](CHANGELOG.en.md)。
+
 ![插件实时运行情况](docs/插件实时运行情况.gif)
 
 ## 1. 插件简介
@@ -36,7 +38,7 @@
 
 ### 安装
 
-将本仓库放到 tosu 的 `static` 目录下，目录名保持 `Mania Replay Master`：
+将本仓库放到 tosu 的 `static` 目录下，推荐目录名 `Mania Replay Master`（本副本目录名为 `Mania Replay Master (fixed)`，tosu 列表里显示的仍是 metadata.txt 中的 `Mania Replay Master`）：
 
 ```bash
 # 方式一：git clone（可直接克隆进 static 目录）
@@ -76,6 +78,11 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
 | Background Color / Opacity | 背景色与不透明度（0 = 全透明） | `#000000` / `0` |
 | Render Scale (%) | 判定区在窗口内的缩放 | `100` |
 | FPS Limit | 重绘帧率上限（0 = 不限） | `0` |
+| Exact Mode Helper URL | 精确模式 helper 地址（仅接受回环地址；留空禁用精确模式） | `http://127.0.0.1:24051` |
+| Exact Mode Helper Token | 可选共享令牌，需与 helper 的 `--token` 一致 | 空 |
+| Analysis Mode | 分析模式：`Auto` 自动、`Live` 只做实时判定、`Replay` 只做回放预渲染 | `Auto` |
+| Exact Replay (helper) | 观看回放时套用 `.osr` 逐列按键时间轴 | 开 |
+| Exact Live (key hook) | 游玩时由 helper 键盘钩子推送逐列按键 | 开 |
 
 ### 常见问题
 
@@ -88,7 +95,24 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
 - **统计面板显示 0 或与游戏不一致？**
   面板优先使用 tosu 提供的游戏计数；当 tosu 读取不到（部分 stable 版本会出现 `play.hits` 全 0）时，会自动回退为按插件匹配的判定计算，回放复盘（完整时间轴）下直接显示最终统计。UR 始终由插件按判定误差计算。
 - **游戏里看不到插件？**
-  确认目录名是 `Mania Replay Master`，且放在 tosu 的 `static` 目录下，然后重启 tosu。
+  确认目录名正确（如 `Mania Replay Master` 或 `Mania Replay Master (fixed)`），且放在 tosu 的 `static` 目录下，然后重启 tosu。
+- **观察回放时没有走精确模式？**
+  精确回放只在 tosu 报告 `replayUIVisible` 为真（即正在观看回放）时启用；实时游玩不会再套用上一次的 `.osr` 时间轴。若 helper 刚刚启动导致首次拉取失败，插件会在 5 秒后自动重试。
+- **重新播放回放时统计面板为什么从零开始？**
+  这是 0.5.2 起的预期行为：统计面板与 UR 按当前回放时间轴计算，倒带或重新播放会归零并随进度增长；谱面音符颜色仍沿用缓存时间轴，方便直接复盘整局。
+- **DT / HT 下判定颜色不对？**
+  osu!mania 在 stable 与 lazer 中都会对判定窗口做 rate 补偿（真实时间窗口长度不变），插件已统一按 `窗口 × rate` 计算；若仍不一致，请附上客户端、mods 与 UR 数据反馈。
+- **同一排和弦 / 连打的判定颜色仍然串位？**
+  和弦必须靠逐列数据才能正确归属。插件把两条链完全拆开：**边玩边分析**只使用 keyboard hook 的逐列按下/抬起事件，按下时判定 note 头、抬起时判定长条尾（`applyLiveKey` + `lockPoint` + `hookSongTime`），绝不读取 `.osr`；**一边播放录像一边分析**只读取 `.osr` 并一次性预渲染整局，不使用键盘钩子。若自动切换不符合当前场景，请把 `Analysis Mode` 手动设为 `Live` 或 `Replay`。
+- **不想常驻 helper，能做到和弦按列归属吗？**
+  可以先试无 helper 模式：插件会消费 tosu precise 的 `keys`（`isPressed`/`count`）作为列提示，并用「未暴露列排除法」处理 tosu 没有送出的列。首次收到有效提示时控制台会打印 `tosu precise keys: column hints active (N slots)`，也可用 `window.__maniaReplayMaster.state.keyHintSeen` 检查。
+  注意：老版 tosu 只送 4 个槽（stable 侧只填 3 个），4K 还能靠排除法补第 4 列，**5K–10K 必须让 tosu 暴露完整列数组**——补丁与说明见 `tools/tosu-mania-keys-patch.md`（stable 需要改内存读取器 + API，lazer 的内部数组已是 N 列、只差 API 透出）。补丁生效后插件自动按列判定，无需 helper。
+- **怎么确认 helper 在工作？**
+  运行时状态栏会显示 `exact: live (A S ; ')`（括号里是 helper 解析出的键位）。如果显示 `exact: helper offline (run tools/mrm-helper.mjs)`，说明 helper 没启动：双击 `tools\start-helper.bat`，或运行 `node "tools/mrm-helper.mjs"`（osu 目录会自动探测，无需填写）。
+- **为什么 Auto 模式下偶尔像在「回放上一局」？**
+  `Auto` 依赖 tosu 的 `replayUIVisible`（普通游玩时是陈旧值）和实时输入来判断模式。如果确定只会实时游玩，建议直接固定为 `Live`；只用于复盘录像则固定为 `Replay`，两条管线不会被彼此污染。
+- **精确模式提示 helper 不可用？**
+  helper 只接受来自回环地址的浏览器请求；若设置了 `--token`，还需在插件设置里填入相同的 `Exact Mode Helper Token`。离开游戏后 helper 会在 10 秒内自动结束键盘钩子进程。
 
 ## 4. 贡献指南
 
@@ -108,7 +132,7 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
 2. 修改后运行测试，确保全绿：
 
    ```bash
-   node test/mrm-test.mjs   # 当前 61 项断言，无需安装依赖
+   node test/mrm-test.mjs   # 当前 86 项断言，无需安装依赖
    ```
 
 3. 提交 PR，说明变更动机与验证方式。
@@ -125,24 +149,38 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
 插件本体无法读取磁盘回放或获取游戏按键，因此提供一个可选的本地辅助进程 `tools/mrm-helper.mjs`（纯 Node，单文件，无需安装依赖，内含 LZMA 解码器）：
 
 ```bash
-# 默认读取 D:\Games\osu!\Data\r，监听 127.0.0.1:24051
-node "tools/mrm-helper.mjs" --osu "D:\Games\osu!" --port 24051
+# osu! 目录自动探测（TOSU_OSU_PATH → tosu.env → 运行中的 osu! 进程 → 注册表 → 系统默认位置）
+node "tools/mrm-helper.mjs" --port 24051
 
-# 如需自行指定谱面目录：
+# 需要覆盖时才传 --osu：
 node "tools/mrm-helper.mjs" --osu "E:\osu!"
+
+# 建议加上令牌（随后在插件设置里填写同一个 Exact Mode Helper Token）：
+node "tools/mrm-helper.mjs" --token my-secret
 ```
 
-工作方式：
+helper 只监听 `127.0.0.1`，并且只接受来自回环地址的浏览器跨域请求；设置 `--token` 后所有请求都必须携带令牌，避免本机其他网页调用 `/live` 订阅按键流。最后一个 SSE 客户端断开 10 秒后，键盘钩子进程会自动退出。
 
-- 观看回放时：helper 按当前谱面 MD5 从 `Data\r` 找到对应 `.osr`，解出**逐帧按键位掩码**（精确列归属），插件自动对齐时间轴并直接计算判定；
-- 实时游玩时：helper 启动 `tools/key-hook.ps1`（Windows 低级键盘钩子，4K–8K 使用 stable 固定键位），把按键事件经 SSE 推送给插件，实现实时精确列渲染。
+#### 启动 / 停止 helper（双击即可）
 
-插件设置中可配置 `helperUrl`（默认 `http://127.0.0.1:24051`）、`exactReplay`、`exactLive`；helper 未运行时插件自动回退到原有 hitError 推断模式。
+- 双击 `tools\start-helper.bat`：helper 隐藏到后台运行；它会监视 `osu!` 与 `tosu`，两者都出现过之后，任一关闭就自动退出（另有 10 分钟无请求兜底退出）。
+- 双击 `tools\stop-helper.bat`：立即关闭 helper。
+- **不需要填 osu! 目录**：helper 会自动探测；要覆盖时才传参 `start-helper.bat "E:\osu!"`；端口 / 令牌等参数可在 `tools\start-helper.vbs` 里改。
+- 探测失败（例如 helper 比 osu! 先启动）也没关系：helper 会在需要读取回放/键位时重试，osu! 出现后即可自动接上。
+- 不需要登录自启、计划任务或常驻 watcher：helper 只在你双击后存在，并会自己收尾。
+- 插件页面打开期间会每 25 秒发一次轻量 `/status` 心跳，用于刷新「10 分钟无请求」的兜底计时。
+
+工作方式（两条独立管线）：
+
+- **实时游玩（Live）**：helper 启动 `tools/key-hook.ps1`（Windows 低级键盘钩子，4K–8K 使用 stable 键位配置），把逐列按下/抬起事件经 SSE 推送给插件；插件使用钩子自带的事件时间戳（锚定到游戏时钟：v2 的 `beatmap.time.live`，若 tosu 提供 `precise.currentTime` 也会用于 10ms 级校正）按 osu! 客户端的音符锁规则实时判定（`applyLiveKey` + `lockPoint` + `hookSongTime`），只使用真实输入，不读取 `.osr`。
+- **观看回放（Replay）**：helper 按当前谱面 MD5 从 `Data\r` 找到对应 `.osr`，解出**逐帧按键位掩码**（精确列归属），插件自动对齐时间轴并把整局判定一次性预渲染（`applyExactTimeline`），不连接键盘钩子。
+
+插件设置中可配置 `helperUrl`（默认 `http://127.0.0.1:24051`）、`helperToken`、`analysisMode`、`exactReplay`、`exactLive`；helper 未运行时插件自动回退到原有 hitError 推断模式。`Analysis Mode` 可选 `Auto`（自动切换）、`Live`（只做实时判定）、`Replay`（只做回放预渲染）；固定场景建议手动指定，避免两条管线互相干扰。
 
 测试：
 
 ```bash
-node test/mrm-test.mjs         # 61 项断言（无需 tosu / helper）
+node test/mrm-test.mjs         # 86 项断言（无需 tosu / helper）
 node test/mrm-exact-test.mjs   # 端到端精确模式（需要 helper 与 Data\r，缺少映射索引时自动跳过）
 node test/mrm-live-check.mjs   # 实时按键通道自检（交互式，按提示按键）
 node test/mrm-live-monitor.mjs # 实机监控并生成诊断日志（需要 helper 与 tosu）
