@@ -141,7 +141,11 @@ const state = {
   keyHintSlotCount: 0,
   keyHintExposed: [],
   keyHintSeen: false,
-  keyHintLogged: false
+  keyHintLogged: false,
+  livePending: [],
+  liveRecentErrors: [],
+  liveErrorCount: 0,
+  liveBias: 0
 };
 
 const renderCache = {
@@ -514,6 +518,10 @@ function resetJudgements() {
   state.sweepFrom = 0;
   state.backfillFloor = -Infinity;
   state.keyHints.length = 0;
+  state.livePending.length = 0;
+  state.liveRecentErrors.length = 0;
+  state.liveErrorCount = 0;
+  state.liveBias = 0;
   const pts = state.points || [];
   for (const p of pts) {
     p.matched = false;
@@ -1171,6 +1179,10 @@ function closeLive() {
   state.liveReady = false;
   state.liveAnchorHook = null;
   state.liveAnchorSong = 0;
+  state.livePending.length = 0;
+  state.liveRecentErrors.length = 0;
+  state.liveErrorCount = 0;
+  state.liveBias = 0;
   state.helperState = "off";
 }
 
@@ -1200,28 +1212,105 @@ function applyLiveKey(column, t, down) {
   if (!state.points || !w || !w.length) return;
   const best = lockPoint(column, t, !down, null, w[w.length - 1]);
   if (best < 0) return;
-  applyMatch(state.points[best], t - state.points[best].time);
+  const point = state.points[best];
+  const e = t - point.time;
+  applyMatch(point, e);
+  const note = state.beatmap && state.beatmap.notes && state.beatmap.notes[point.note];
+  const canCorrect = state.scoreV2 || !note || !note.hold;
+  if (canCorrect) {
+    const now = performance.now();
+    const implied = renderTime();
+    let matched = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < state.liveRecentErrors.length; i++) {
+      const entry = state.liveRecentErrors[i];
+      if (now - entry.at > 300) continue;
+      const dist = Math.abs(point.time - (implied - entry.e));
+      if (dist < bestDist) {
+        bestDist = dist;
+        matched = i;
+      }
+    }
+    if (matched >= 0 && bestDist <= 250) {
+      const eGame = state.liveRecentErrors[matched].e;
+      state.liveRecentErrors.splice(matched, 1);
+      correctMatch(point, eGame);
+      return;
+    }
+    state.livePending.push({ point, e, at: now });
+    if (state.livePending.length > 64) state.livePending.shift();
+  }
+}
+
+function applyLiveCorrections(arr) {
+  if (!Array.isArray(arr)) return;
+  if (arr.length < state.liveErrorCount) {
+    state.liveErrorCount = 0;
+    state.livePending.length = 0;
+  }
+  for (let i = state.liveErrorCount; i < arr.length; i++) correctLiveError(arr[i]);
+  state.liveErrorCount = arr.length;
+}
+
+function correctLiveError(eGame) {
+  const now = performance.now();
+  const implied = renderTime() - eGame;
+  let best = null;
+  let bestScore = Infinity;
+  for (const entry of state.livePending) {
+    if (now - entry.at > 300) continue;
+    if (Math.abs(entry.point.time - implied) > 250) continue;
+    const score = Math.abs(entry.e - eGame);
+    if (score < bestScore) {
+      bestScore = score;
+      best = entry;
+    }
+  }
+  if (!best) {
+    state.liveRecentErrors.push({ e: eGame, at: now });
+    if (state.liveRecentErrors.length > 16) state.liveRecentErrors.shift();
+    return;
+  }
+  const idx = state.livePending.indexOf(best);
+  if (idx >= 0) state.livePending.splice(idx, 1);
+  const delta = best.e - eGame;
+  if (Math.abs(delta) < 200) state.liveBias = clamp(state.liveBias * 0.8 + delta * 0.2, -150, 150);
+  correctMatch(best.point, eGame);
+}
+
+function correctMatch(point, eGame) {
+  const oldE = point.e;
+  if (!Number.isFinite(oldE) || oldE === eGame) return;
+  state.errorSum += eGame - oldE;
+  state.errorSq += eGame * eGame - oldE * oldE;
+  point.e = eGame;
+  point.j = classifyError(eGame);
+  point.at = point.time + eGame;
+  const ns = state.noteState[point.note];
+  if (ns) {
+    if (point.end) {
+      if (state.scoreV2) ns.tail = point.j;
+    } else {
+      ns.head = point.j;
+    }
+  }
+  if (!state.scoreV2) settleV1LongNote(point.note);
 }
 
 function hookSongTime(hookT) {
   const h = Number(hookT);
   if (!Number.isFinite(h)) return renderTime();
-  const rate = clamp(state.modsRate || 1, 0.5, 2);
-  if (state.liveAnchorHook === null) {
-    state.liveAnchorHook = h;
-    state.liveAnchorSong = renderTime();
-    return state.liveAnchorSong;
-  }
-  const predicted = state.liveAnchorSong + (h - state.liveAnchorHook) * rate;
+  const rate = clamp(state.modsRate || state.timeSpeed || 1, 0.5, 2);
   const measured = renderTime();
-  const drift = measured - predicted;
-  if (Math.abs(drift) > 400) {
-    state.liveAnchorHook = h;
-    state.liveAnchorSong = measured;
-    return measured;
+  const anchor = state.liveAnchorHook;
+  let t = measured;
+  if (anchor !== null && h > anchor && h - anchor <= 750) {
+    t = state.liveAnchorSong + (h - anchor) * rate;
+    if (Math.abs(measured - t) > 120) t = measured;
   }
-  if (Math.abs(drift) > 40) state.liveAnchorSong += drift * 0.02;
-  return predicted;
+  state.liveAnchorHook = h;
+  state.liveAnchorSong = t;
+  return t - state.liveBias;
 }
 
 function ensureLive() {
@@ -1433,9 +1522,9 @@ function getScroll(map, timeRange) {
 
 function visibleStartIndex(map, scroll, now, t, hitPos) {
   const notes = map.notes;
-  if (renderCache.cursorMap !== map || t < renderCache.cursorTime - 1500) {
+  if (renderCache.cursorMap !== map || t < renderCache.cursorTime - 32) {
     renderCache.cursorMap = map;
-    renderCache.cursor = Math.max(0, findFirstGE(notes, t - 30000, (n) => n.time));
+    renderCache.cursor = 0;
   }
   const postFrac = (480 - hitPos) / hitPos + 0.2;
   let i = renderCache.cursor;
@@ -1994,6 +2083,7 @@ function onPrecise(data) {
   const current = Number(data.currentTime);
   if (Number.isFinite(current)) setTime(current);
   updateKeyHints(data.keys);
+  if (state.liveActive) applyLiveCorrections(data.hitErrors);
   if (state.exactApplied || state.liveActive) return;
   const arr = data.hitErrors;
   if (!Array.isArray(arr)) return;
@@ -2077,6 +2167,7 @@ window.__maniaReplayMaster = {
   buildManiaNotes,
   makeScroll,
   getScroll,
+  visibleStartIndex,
   localWindows,
   updateWindows,
   classifyError,
@@ -2112,6 +2203,7 @@ window.__maniaReplayMaster = {
   onPrecise,
   updateKeyHints,
   consumeError,
+  applyLiveCorrections,
   renderTime,
   setTime,
   renderScene,

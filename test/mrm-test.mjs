@@ -436,6 +436,88 @@ const rateA = api.hookSongTime(6000);
 const rateB = api.hookSongTime(6010);
 ok("hook clock scales with rate", Math.abs(rateB - rateA - 15) < 1e-6, [rateA, rateB]);
 api.state.modsRate = 1;
+const stallBase = api.hookSongTime(2000);
+sb.__advance(2000);
+const stallResync = api.hookSongTime(2001);
+ok("hook clock resyncs to game clock after a stall", Math.abs(stallResync - api.renderTime()) < 5, [stallBase, stallResync, api.renderTime()]);
+
+console.log("== live game-error correction ==");
+hintSetup(["64,192,1000,1,0,0:0:0:0:"], 4);
+api.state.liveActive = true;
+api.state.livePending = [];
+api.state.liveErrorCount = 0;
+api.state.liveBias = 0;
+api.setTime(1000);
+api.applyLiveKey(0, 1050, true);
+ok("tentative live match classified from hook time", api.state.noteState[0].head === 2, api.state.noteState[0].head);
+api.onPrecise({ currentTime: 1000, hitErrors: [5] });
+ok("game hitError corrects the live match", api.state.noteState[0].head === 0, api.state.noteState[0].head);
+ok("correction keeps stats consistent", Math.abs(api.state.errorSum - 5) < 1e-9 && Math.abs(api.state.liveBias - 9) < 1e-9, [api.state.errorSum, api.state.liveBias]);
+api.state.liveActive = true;
+api.state.livePending.length = 0;
+api.state.liveRecentErrors.length = 0;
+api.state.liveBias = 0;
+hintSetup(["64,192,2000,1,0,0:0:0:0:"], 4);
+api.state.liveActive = true;
+api.state.livePending.length = 0;
+api.state.liveRecentErrors.length = 0;
+api.state.liveErrorCount = 0;
+api.state.liveBias = 0;
+api.setTime(2000);
+api.onPrecise({ currentTime: 2000, hitErrors: [7] });
+api.applyLiveKey(0, 2050, true);
+ok("game error arriving first still corrects the match", api.state.noteState[0].head === 0, api.state.noteState[0].head);
+api.state.liveActive = false;
+api.state.livePending.length = 0;
+api.state.liveRecentErrors.length = 0;
+api.state.liveErrorCount = 0;
+
+console.log("== render cursor after small rewind ==");
+const seekMap = api.buildManiaNotes(
+  api.parseOsu(
+    [
+      "osu file format v14",
+      "",
+      "[General]",
+      "Mode: 3",
+      "",
+      "[Difficulty]",
+      "CircleSize:4",
+      "OverallDifficulty:8.5",
+      "",
+      "[TimingPoints]",
+      "0,500,4,2,0,100,1,0",
+      "",
+      "[HitObjects]",
+      "64,192,2500,1,0,0:0:0:0:",
+      "64,192,5000,1,0,0:0:0:0:"
+    ].join("\n")
+  ),
+  4
+);
+api.state.beatmap = seekMap;
+api.state.csConverted = 4;
+api.state.mapMode = "mania";
+api.state.gameState = "play";
+api.state.hitWindow = null;
+api.state.maniaScrollSpeed = 5;
+api.settings.maniaScrollSpeedOverride = 0;
+api.settings.hitPosition = 80;
+api.updateWindows();
+api.state.points = null;
+api.buildPoints();
+const prevShows = [api.settings.showActions, api.settings.showStats, api.settings.showHitLine];
+api.settings.showActions = false;
+api.settings.showStats = false;
+api.settings.showHitLine = false;
+api.renderScene(mainCtx, 5000);
+const seekBefore = mainCtx.calls.length;
+api.renderScene(mainCtx, 2500);
+const seekStrokes = mainCtx.calls.slice(seekBefore).filter((c) => c === "stroke").length;
+ok("notes render again after a small rewind", seekStrokes >= 1, seekStrokes);
+api.settings.showActions = prevShows[0];
+api.settings.showStats = prevShows[1];
+api.settings.showHitLine = prevShows[2];
 
 console.log("== live SSE chord attribution ==");
 const sseMap = api.buildManiaNotes(

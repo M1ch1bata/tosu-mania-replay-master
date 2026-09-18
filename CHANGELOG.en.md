@@ -1,3 +1,15 @@
+# Mania Replay Master v0.5.2 — Update Notes
+
+This is a patch release on top of v0.5.1, addressing three issues:
+
+- **Notes missing after small rewinds in replays**: the render cursor was only reset on jumps larger than 1.5 seconds, so notes inside a short rewind were skipped; it now resets on any backward jump.
+- **Live timing bias**: the hook clock used to be anchored once on the first key event, permanently recording that event's delay; it now advances event-to-event and resyncs to the game clock on stalls or large deviations.
+- **Live judgements now follow the game's `hitErrors`**: the keyboard hook only picks the lane, and the game's exact error overrides the tentative value, so colours, action markers and UR match the game (removing the offset caused by the plugin's time base).
+
+Tests: 92 unit assertions and 6 replay end-to-end assertions pass. The helper and usage are unchanged from v0.5.1.
+
+---
+
 # Mania Replay Master v0.5.1 — Update Notes
 
 This update focuses on one long-standing issue: **judgement colours on chords (multiple notes falling in the same row) frequently did not match the keys you actually pressed**. It also fully separates "analyze while playing" from "analyze while watching a replay", and turns the exact-mode helper into a double-click tool that cleans up after itself.

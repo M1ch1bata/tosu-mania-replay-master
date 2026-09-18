@@ -5,7 +5,7 @@
 
 > A real-time mania replay & judgement overlay for tosu, inspired by Mania-Replay-Master.
 
-> **本目录是代码审查后的修复版本（v0.5.1，基于上游 0.5.0）**：修复清单见 [FIXES.md](FIXES.md)，更新说明见 [中文](CHANGELOG.zh.md) / [English](CHANGELOG.en.md)。
+> **本目录是代码审查后的修复版本（v0.5.2，基于上游 0.5.0）**：修复清单见 [FIXES.md](FIXES.md)，更新说明见 [中文](CHANGELOG.zh.md) / [English](CHANGELOG.en.md)。
 
 ![插件实时运行情况](docs/插件实时运行情况.gif)
 
@@ -132,7 +132,7 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
 2. 修改后运行测试，确保全绿：
 
    ```bash
-   node test/mrm-test.mjs   # 当前 86 项断言，无需安装依赖
+   node test/mrm-test.mjs   # 当前 92 项断言，无需安装依赖
    ```
 
 3. 提交 PR，说明变更动机与验证方式。
@@ -180,7 +180,7 @@ helper 只监听 `127.0.0.1`，并且只接受来自回环地址的浏览器跨�
 测试：
 
 ```bash
-node test/mrm-test.mjs         # 86 项断言（无需 tosu / helper）
+node test/mrm-test.mjs         # 92 项断言（无需 tosu / helper）
 node test/mrm-exact-test.mjs   # 端到端精确模式（需要 helper 与 Data\r，缺少映射索引时自动跳过）
 node test/mrm-live-check.mjs   # 实时按键通道自检（交互式，按提示按键）
 node test/mrm-live-monitor.mjs # 实机监控并生成诊断日志（需要 helper 与 tosu）
