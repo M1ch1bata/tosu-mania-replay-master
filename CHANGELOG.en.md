@@ -1,3 +1,15 @@
+# Mania Replay Master v0.5.3 — Update Notes
+
+This patch fixes notes that stayed in the unjudged colour (`#8fa3c8`) after crossing the judgement line:
+
+- **Judgement credited to a later note after a stall**: `renderTime()` no longer extrapolates from a time sample older than 250ms. A precise-stream gap (>120ms) or a song-time jump (>250ms) switches the next 500ms of hitErrors to note-order matching, so a delayed error can no longer steal a later note's judgement.
+- **Lane-4 elimination without real key hints**: the "unexposed column" elimination now only runs after a real per-column hint has been observed (`keyHintSeen`). stable mania reports all-zero key slots, which previously forced ambiguous hits onto the assumed hidden column.
+- **Stale-clock fallback**: if the implied hit time is more than 260ms ahead of the earliest unjudged note and no miss is pending, the hit is matched in note order.
+
+Tests: 92/92 unit assertions pass.
+
+---
+
 # Mania Replay Master v0.5.2 — Update Notes
 
 This is a patch release on top of v0.5.1, addressing three issues:

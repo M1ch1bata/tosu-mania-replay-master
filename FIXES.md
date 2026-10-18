@@ -1,6 +1,6 @@
 # 修复记录（相对上游 0.5.0）
 
-本目录 `Mania Replay Master (fixed)` 是代码审查后的修复版本，版本号 0.5.2（基于上游 0.5.0）。
+本目录 `Mania Replay Master (fixed)` 是代码审查后的修复版本，版本号 0.5.3（基于上游 0.5.0）。
 以下按审查发现的问题逐条对应修改，测试为 `node test/mrm-test.mjs`（92/92 通过）。
 
 ## P0 安全
@@ -163,8 +163,23 @@
   - 偏差反馈：配对差值以 EMA 记入 `liveBias`，在 `hookSongTime` 中扣减，让预判值随时间收敛。
 - 测试：新增 4 条断言——预判分类、hitError 覆盖、统计量一致（`errorSum`/`liveBias`）、误差先到仍能配对。
 
-## 未改动 / 保留的已知设计
+### 17. 卡顿/暂停后 hitError 记到后面的音符，原音符永远未判定（0.5.3）
+- 文件：`main.js`
+- 现象：截图中的音符已经越过判定线，却一直是未判定色（`#8fa3c8`），而它后面、还没到线的音符反而拿到了 300 的黄色判定。
+- 原因：`renderTime()` 会从最后一次 v2 时间样本外推最多 300ms。暂停、WebView 卡顿或 tosu 抖动时，v2 样本过期或 precise 消息堆积，`implied = pressTime - e` 落到更晚的音符附近；`processError()` 用“最近音符”匹配，于是把判定记到后面的音符，真正被按下的那个音符永远没有判定。
+- 修复：
+  - `renderTime()`：时间样本超过 250ms 未更新时直接返回 `state.time`，不再外推；
+  - `onPrecise()`：记录 precise 间隔，>120ms 视为卡顿，之后 500ms 内的 hitError 按音符顺序匹配；
+  - `setTime()`：检测 >250ms 的前跳（暂停恢复、回放跳转），同样进入顺序匹配；
+  - `processError()`：若推算时间比最早未判定音符超前 >260ms 且没有待补 miss，按音符顺序匹配。
+### 18. 没有按键提示时仍启用“第 4 列排除法”（0.5.3）
+- 文件：`main.js`
+- 现象：无关卡/客户端，个别 hitError 会被固定配到第 4 列。
+- 原因：`updateKeyHints()` 只要收到 tosu 的 4 个 key 槽位就把 `keyHintExposed` 设为 `[true,true,true,false]`，但 stable mania 的 `keys` 恒为 0，`keyHintSeen` 从不为真；`consumeError()` 仍按“前三列已知、只剩第 4 列未知”做排除，把落点接近第 4 列的 hitError 强行归到第 4 列。
+- 修复：仅当 `keyHintSeen === true` 时才执行排除法，否则交给 `processError()` 做时间/顺序匹配。
+- 验证：92/92 单测通过；A/B 仿真中，同样的“时钟前跳 + 单个延迟 hitError”场景由“记到 2776ms 音符”变为“正确记到 2261ms 音符”。
 
+## 未改动 / 保留的已知设计
 - `classifyError()` 对超出 50 窗口的已记录误差固定归类为 50（测试 `recorded hit never classifies as miss` 固化）：依赖 tosu precise 只上报“已命中的判定”。如未来 tosu 开始上报 miss，需要重新评估。
 - `fitExactOffset()` 仍在浏览器主线程执行；长图首次加载可能有一次性卡顿，后续可下沉到 helper 计算。
 - `state.errorCount` 同时承担“precise 已消费下标”和“exact 统计数”两种含义；本次仅修复行为，未做字段拆分，改动该字段需要同步梳理 `onPrecise` / `applyRun` / `applyExactTimeline` 三处。

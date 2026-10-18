@@ -145,7 +145,9 @@ const state = {
   livePending: [],
   liveRecentErrors: [],
   liveErrorCount: 0,
-  liveBias: 0
+  liveBias: 0,
+  lastPreciseAt: 0,
+  preciseStalledUntil: 0
 };
 
 const renderCache = {
@@ -218,6 +220,7 @@ function setTime(t) {
   if (!Number.isFinite(t)) return;
   const now = performance.now();
   const dt = now - state.timeLocal;
+  const delta = t - state.time;
   if (dt > 0 && dt < 1000) {
     const inst = (t - state.time) / dt;
     if (inst >= 0 && inst < 12) state.timeSpeed = state.timeSpeed * 0.75 + inst * 0.25;
@@ -225,13 +228,23 @@ function setTime(t) {
   } else {
     state.timeSpeed = 1;
   }
+  // A forward jump (pause/resume, replay seek, tosu hiccup) makes `renderTime()` point at a
+  // later part of the map than the hitErrors currently being delivered. Match the next
+  // couple of batches by note order instead of by that misleading wall-clock time.
+  if (delta > 250) state.preciseStalledUntil = now + 500;
   state.time = t;
   state.timeLocal = now;
 }
 
 function renderTime() {
   const now = performance.now();
-  const dt = clamp(now - state.timeLocal, 0, 300);
+  const age = now - state.timeLocal;
+  // A stale time sample means the v2 stream stalled (pause, webview/GC stall, tosu hiccup).
+  // Extrapolating from it would run the playfield ahead of the game, so freeze on the last
+  // known song time instead. Without this a single 300ms stall could shift the clock far
+  // enough that a hitError lines up with a later note and the real note stays unjudged.
+  if (age > 250 || !Number.isFinite(state.time)) return state.time;
+  const dt = clamp(age, 0, 200);
   return state.time + dt * clamp(state.timeSpeed, 0, 12);
 }
 
@@ -579,6 +592,21 @@ function processError(e, pressTime) {
         return;
       }
     }
+    // If the clock is far ahead of the earliest note that still has no judgement and no
+    // miss is pending, that note cannot be a skipped one: the delayed hitError belongs to
+    // it, not to a later note. Matching by note order avoids crediting the later note and
+    // leaving this one unjudged forever.
+    let firstUnmatched = -1;
+    for (let i = 0; i < pts.length; i++) {
+      if (!pts[i].matched) {
+        firstUnmatched = i;
+        break;
+      }
+    }
+    if (firstUnmatched >= 0 && !canMarkMiss() && implied - pts[firstUnmatched].time > 260) {
+      matchPoint(pts[firstUnmatched], e, near);
+      return;
+    }
     if (bestOpen < 0) return;
     matchPoint(pts[bestOpen], e, near);
     return;
@@ -741,27 +769,33 @@ function consumeError(e, pressTime) {
       return;
     }
   }
-  const candidates = [];
-  for (let c = 0; c < map.keys; c++) {
-    if (c < state.keyHintSlotCount && state.keyHintExposed[c]) continue;
-    const list = state.columnPoints[c];
-    if (!list) continue;
-    let best = -1;
-    let bestDist = Infinity;
-    for (const i of list) {
-      const p = pts[i];
-      if (p.matched || p.end) continue;
-      const dist = Math.abs(p.time - implied);
-      if (dist < bestDist) {
-        bestDist = dist;
-        best = i;
+  // Only use the "unexposed column" elimination once a real per-column hint has been
+  // observed. tosu keeps reporting four key slots for stable mania even when all counts
+  // stay 0, so without this guard the plugin treats columns 0-2 as "known" forever and
+  // forces ambiguous hitErrors onto the one slot it thinks is hidden.
+  if (state.keyHintSeen) {
+    const candidates = [];
+    for (let c = 0; c < map.keys; c++) {
+      if (c < state.keyHintSlotCount && state.keyHintExposed[c]) continue;
+      const list = state.columnPoints[c];
+      if (!list) continue;
+      let best = -1;
+      let bestDist = Infinity;
+      for (const i of list) {
+        const p = pts[i];
+        if (p.matched || p.end) continue;
+        const dist = Math.abs(p.time - implied);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = i;
+        }
       }
+      if (best >= 0 && bestDist <= missW) candidates.push({ i: best, dist: bestDist });
     }
-    if (best >= 0 && bestDist <= missW) candidates.push({ i: best, dist: bestDist });
-  }
-  if (candidates.length === 1) {
-    matchPoint(pts[candidates[0].i], e, missW + 60);
-    return;
+    if (candidates.length === 1) {
+      matchPoint(pts[candidates[0].i], e, missW + 60);
+      return;
+    }
   }
   processError(e, pressTime);
 }
@@ -2080,6 +2114,15 @@ function onV2(data) {
 
 function onPrecise(data) {
   if (!data) return;
+  const nowMs = performance.now();
+  const preciseGap = state.lastPreciseAt ? nowMs - state.lastPreciseAt : 0;
+  state.lastPreciseAt = nowMs;
+  // A gap far above the 10ms precise poll means this message (or the ones queued behind
+  // it) was delayed. Their hitErrors were produced earlier than the clock says, so they
+  // must be matched in note order instead of by wall-clock `implied` time; otherwise a
+  // delayed error can be credited to a later note and the real note stays unjudged.
+  if (preciseGap > 120) state.preciseStalledUntil = nowMs + 500;
+  const stalled = nowMs < state.preciseStalledUntil;
   const current = Number(data.currentTime);
   if (Number.isFinite(current)) setTime(current);
   updateKeyHints(data.keys);
@@ -2115,7 +2158,7 @@ function onPrecise(data) {
   if (arr.length < state.errorCount) resetJudgements();
   if (arr.length > state.errorCount) {
     const count = arr.length - state.errorCount;
-    if (count > 4 || state.errorCount === 0 || state.timeSpeed > 1.25) {
+    if (count > 1 || stalled || state.errorCount === 0 || state.timeSpeed > 1.25) {
       for (let i = state.errorCount; i < arr.length; i++) {
         state.runPrefix.push(arr[i]);
         consumeError(arr[i], null);

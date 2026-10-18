@@ -5,7 +5,7 @@
 
 > A real-time mania replay & judgement overlay for tosu, inspired by Mania-Replay-Master.
 
-> **本目录是代码审查后的修复版本（v0.5.2，基于上游 0.5.0）**：修复清单见 [FIXES.md](FIXES.md)，更新说明见 [中文](CHANGELOG.zh.md) / [English](CHANGELOG.en.md)。
+> **本目录是代码审查后的修复版本（v0.5.3，基于上游 0.5.0）**：修复清单见 [FIXES.md](FIXES.md)，更新说明见 [中文](CHANGELOG.zh.md) / [English](CHANGELOG.en.md)。
 
 ![插件实时运行情况](docs/插件实时运行情况.gif)
 
