@@ -130,6 +130,16 @@ const state = {
   replayUi: false,
   failed: false,
   modsNumber: 0,
+  mirror: false,
+  random: false,
+  randomForced: false,
+  seed: null,
+  rdColumns: null,
+  seedKind: null,
+  rdSamples: [],
+  columnForward: null,
+  columnBackward: null,
+  columnKeys: 0,
   pendingApply: false,
   cached: false,
   cachedErrors: null,
@@ -424,13 +434,344 @@ function maniaCps(timing, svScale) {
   }));
 }
 
+// ---------------------------------------------------------------------------
+// Column-changing mods: Mirror (MR) flips the columns, Random (RD) shuffles them.
+// osu!stable derives the RD shuffle from the seed stored in the replay's final
+// `-12345|0|0|<seed>` frame, using .NET's System.Random fed through a rejection
+// sampler (not Fisher-Yates). The resulting permutation maps beatmap columns to
+// displayed columns; replay frames and physical keys use the displayed ones.
+// See docs/stable-mania-random.md for the full format and test vectors.
+function dotNetRandom(seed) {
+  const MBIG = 2147483647;
+  const MSEED = 161803398;
+  const subtraction = seed === -2147483648 ? 2147483647 : Math.abs(Math.trunc(seed) | 0);
+  let mj = MSEED - subtraction;
+  const seedArray = new Array(56).fill(0);
+  seedArray[55] = mj;
+  let mk = 1;
+  for (let i = 1; i < 55; i++) {
+    const ii = (21 * i) % 55;
+    seedArray[ii] = mk;
+    mk = mj - mk;
+    if (mk < 0) mk += MBIG;
+    mj = seedArray[ii];
+  }
+  for (let k = 1; k < 5; k++) {
+    for (let i = 1; i < 56; i++) {
+      seedArray[i] -= seedArray[1 + ((i + 30) % 55)];
+      if (seedArray[i] < 0) seedArray[i] += MBIG;
+    }
+  }
+  let inext = 0;
+  let inextp = 21;
+  const sample = () => {
+    if (++inext >= 56) inext = 1;
+    if (++inextp >= 56) inextp = 1;
+    let r = seedArray[inext] - seedArray[inextp];
+    if (r === MBIG) r--;
+    if (r < 0) r += MBIG;
+    seedArray[inext] = r;
+    return r * (1 / MBIG);
+  };
+  return (max) => Math.floor(sample() * max);
+}
+
+// stable's mania RD shuffle: draw a random column, redraw when it is already taken.
+function rdShuffledColumns(seed, keys) {
+  const next = dotNetRandom(seed);
+  const n = Math.max(1, Math.round(Number(keys) || 0));
+  const used = new Set();
+  const out = [];
+  while (out.length < n) {
+    const v = next(n);
+    if (used.has(v)) continue;
+    used.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+// osu!lazer's mania RD shuffle: sort the column indices by a random key (.NET LINQ
+// OrderBy is a stable sort, so the original index breaks ties). Same direction as the
+// stable sampler: the list maps beatmap columns to displayed columns.
+function lazerShuffledColumns(seed, keys) {
+  const next = dotNetRandom(seed);
+  const n = Math.max(1, Math.round(Number(keys) || 0));
+  const items = [];
+  for (let i = 0; i < n; i++) items.push({ c: i, r: next(2147483647) });
+  items.sort((a, b) => (a.r - b.r) || (a.c - b.c));
+  return items.map((x) => x.c);
+}
+
+// osu!lazer's legacy .osr exporter always writes `-12345|0|0|0` (the seed is not part of
+// the legacy format it can produce) and replays before 20130319 have no seed frame at
+// all. In both cases the RD shuffle has to be reconstructed from the recorded presses:
+// every displayed column is matched against the chart by note count and then by note
+// timing, and the winner is only accepted when it is unambiguous.
+function inferColumnPermutation(notes, actions, keys) {
+  const n = Math.max(1, Math.round(Number(keys) || 0));
+  if (!Array.isArray(notes) || !notes.length) return null;
+  if (!Array.isArray(actions) || actions.length < 12) return null;
+  if (n < 2 || n > 7) return null;
+  const noteCount = new Array(n).fill(0);
+  const noteTimes = Array.from({ length: n }, () => []);
+  for (const note of notes) {
+    if (!note || !Number.isFinite(note.time)) continue;
+    const c = Number.isFinite(note.raw) ? note.raw : note.column;
+    if (!Number.isFinite(c) || c < 0 || c >= n) continue;
+    noteCount[c] += 1;
+    noteTimes[c].push(note.time);
+  }
+  for (const arr of noteTimes) arr.sort((a, b) => a - b);
+  const actionCount = new Array(n).fill(0);
+  for (const a of actions) {
+    const c = Math.round(Number(a.column));
+    if (Number.isFinite(c) && c >= 0 && c < n) actionCount[c] += 1;
+  }
+  const perms = [];
+  const idx = new Array(n);
+  const used = new Array(n).fill(0);
+  const build = (depth) => {
+    if (depth === n) {
+      perms.push(idx.slice());
+      return;
+    }
+    for (let c = 0; c < n; c++) {
+      if (used[c]) continue;
+      used[c] = 1;
+      idx[depth] = c;
+      build(depth + 1);
+      used[c] = 0;
+    }
+  };
+  build(0);
+  // A pure column shuffle keeps every column's note count, which prunes the search before
+  // the expensive timing pass.
+  const slack = Math.max(4, Math.round(actions.length * 0.02));
+  const candidates = perms.filter((perm) => {
+    for (let d = 0; d < n; d++) if (Math.abs(actionCount[d] - noteCount[perm[d]]) > slack) return false;
+    return true;
+  });
+  if (!candidates.length) return null;
+  const stride = Math.max(1, Math.round(actions.length / 300));
+  const sample = actions.filter((_, i) => i % stride === 0);
+  const nearestDiff = (arr, t, limit) => {
+    if (!arr.length) return NaN;
+    let lo = 0;
+    let hi = arr.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid] < t) lo = mid + 1;
+      else hi = mid;
+    }
+    let best = NaN;
+    let bestD = Infinity;
+    for (let k = lo - 1; k <= lo; k++) {
+      if (k < 0 || k >= arr.length) continue;
+      const d = arr[k] - t;
+      if (Math.abs(d) < bestD) {
+        bestD = Math.abs(d);
+        best = d;
+      }
+    }
+    return bestD <= limit ? best : NaN;
+  };
+  const scorePerm = (perm) => {
+    const diffs = [];
+    for (const a of sample) {
+      const d = Math.round(Number(a.column));
+      if (!Number.isFinite(d) || d < 0 || d >= n) continue;
+      const diff = nearestDiff(noteTimes[perm[d]], Number(a.time), 300);
+      if (Number.isFinite(diff)) diffs.push(diff);
+    }
+    if (diffs.length < sample.length * 0.25) return 0;
+    diffs.sort((x, y) => x - y);
+    const offset = diffs[Math.floor(diffs.length / 2)];
+    let score = 0;
+    for (const a of sample) {
+      const d = Math.round(Number(a.column));
+      if (!Number.isFinite(d) || d < 0 || d >= n) continue;
+      const diff = nearestDiff(noteTimes[perm[d]], Number(a.time), 300);
+      if (Number.isFinite(diff) && Math.abs(diff - offset) <= 30) score += 1;
+    }
+    return score;
+  };
+  let best = null;
+  let bestScore = -1;
+  let secondScore = -1;
+  for (const perm of candidates) {
+    const score = scorePerm(perm);
+    if (score > bestScore) {
+      secondScore = bestScore;
+      bestScore = score;
+      best = perm;
+    } else if (score > secondScore) {
+      secondScore = score;
+    }
+  }
+  if (!best || bestScore < sample.length * 0.6) return null;
+  if (bestScore - secondScore < Math.max(4, Math.round(sample.length * 0.03))) return null;
+  return best;
+}
+
+function displayColumn(column) {
+  const map = state.columnForward;
+  if (map && Number.isFinite(column)) {
+    const v = map[column];
+    if (Number.isFinite(v)) return v;
+  }
+  // Fallback for Mirror when no map has been built yet (e.g. a chart is built right
+  // after the mods changed, before applyMods() had a chance to rebuild the mapping).
+  if (state.mirror && state.columnKeys > 0 && Number.isFinite(column)) return state.columnKeys - 1 - column;
+  return column;
+}
+
+function sourceColumn(column) {
+  const map = state.columnBackward;
+  if (map && Number.isFinite(column)) {
+    const v = map[column];
+    if (Number.isFinite(v)) return v;
+  }
+  if (state.mirror && state.columnKeys > 0 && Number.isFinite(column)) return state.columnKeys - 1 - column;
+  return column;
+}
+
+function columnMapKey() {
+  if (!state.random && !state.mirror) return "plain";
+  const rd = state.random ? `rd${Number.isFinite(state.seed) ? `${state.seedKind || "stable"}${state.seed}` : state.rdColumns ? "inferred" : "pending"}` : "";
+  return `${rd}${state.mirror ? "-mr" : ""}`;
+}
+
+function rebuildColumnMap(keys) {
+  const n = Math.max(1, Math.round(Number(keys) || 0));
+  state.columnKeys = n;
+  if (!state.random && !state.mirror) {
+    state.columnForward = null;
+    state.columnBackward = null;
+    return;
+  }
+  const forward = new Array(n);
+  for (let c = 0; c < n; c++) forward[c] = c;
+  if (state.random) {
+    let shuffled = null;
+    if (Number.isFinite(state.seed)) {
+      shuffled = state.seedKind === "lazer"
+        ? lazerShuffledColumns(state.seed, n)
+        : rdShuffledColumns(state.seed, n);
+    }
+    else if (Array.isArray(state.rdColumns) && state.rdColumns.length === n) {
+      // Inferred live: state.rdColumns maps displayed column -> beatmap column.
+      shuffled = new Array(n);
+      for (let d = 0; d < n; d++) {
+        const c = state.rdColumns[d];
+        if (Number.isFinite(c) && c >= 0 && c < n) shuffled[c] = d;
+      }
+    }
+    if (shuffled) for (let c = 0; c < n; c++) forward[c] = shuffled[c];
+  }
+  if (state.mirror) for (let c = 0; c < n; c++) forward[c] = n - 1 - forward[c];
+  const backward = new Array(n);
+  for (let c = 0; c < n; c++) {
+    const d = forward[c];
+    if (Number.isFinite(d) && d >= 0 && d < n) backward[d] = c;
+  }
+  state.columnForward = forward;
+  state.columnBackward = backward;
+}
+
+// Live RD has no .osr yet (the seed is only written when the score is saved), so the
+// shuffle is inferred from the first presses: score every column permutation against the
+// chart, and lock the winner once it clears a margin. Until then the identity mapping is
+// used, so the first seconds may be coloured in the wrong lane; they are corrected once
+// the chart is rebuilt with the inferred mapping.
+function sampleLiveRandom(displayCol, songTime) {
+  const map = state.beatmap;
+  if (!state.random || Number.isFinite(state.seed) || state.rdColumns) return;
+  if (!map || !Array.isArray(map.notes) || !map.notes.length) return;
+  if (state.rdSamples.length >= 400) return;
+  if (!Number.isFinite(displayCol) || !Number.isFinite(songTime)) return;
+  state.rdSamples.push({ column: displayCol, time: songTime });
+  if (state.rdSamples.length < 48) return;
+  const keys = map.keys;
+  if (keys < 2 || keys > 7) return;
+  const perms = [];
+  const idx = new Array(keys);
+  const build = (depth, used) => {
+    if (depth === keys) {
+      perms.push(idx.slice());
+      return;
+    }
+    for (let c = 0; c < keys; c++) {
+      if (used[c]) continue;
+      used[c] = 1;
+      idx[depth] = c;
+      build(depth + 1, used);
+      used[c] = 0;
+    }
+  };
+  build(0, new Array(keys).fill(0));
+  const byColumn = new Array(keys);
+  for (let c = 0; c < keys; c++) byColumn[c] = [];
+  for (const note of map.notes) {
+    const raw = Number.isFinite(note.raw) ? note.raw : note.column;
+    if (byColumn[raw]) byColumn[raw].push(note.time);
+  }
+  for (const arr of byColumn) arr.sort((a, b) => a - b);
+  const tol = 60;
+  const near = (arr, t) => {
+    let lo = 0;
+    let hi = arr.length - 1;
+    let best = Infinity;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const d = arr[mid] - t;
+      if (Math.abs(d) < best) best = Math.abs(d);
+      if (d < 0) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return best <= tol;
+  };
+  const samples = state.rdSamples;
+  let bestScore = -1;
+  let secondScore = -1;
+  let bestPerm = null;
+  for (const perm of perms) {
+    let score = 0;
+    for (const s of samples) {
+      let d = s.column;
+      if (state.mirror) d = keys - 1 - d;
+      const c = perm[d];
+      if (c !== undefined && near(byColumn[c], s.time)) score++;
+    }
+    if (score > bestScore) {
+      secondScore = bestScore;
+      bestScore = score;
+      bestPerm = perm;
+    } else if (score > secondScore) {
+      secondScore = score;
+    }
+  }
+  if (!bestPerm || bestScore < samples.length * 0.4 || bestScore - secondScore < 6) return;
+  state.rdColumns = bestPerm;
+  state.loadedKey = "";
+  rebuildColumnMap(keys);
+  resetJudgements();
+  state.rdSamples = [];
+  ensureBeatmap();
+}
+
 function buildManiaNotes(parsed, keys) {
+  state.columnKeys = Math.max(1, Math.round(Number(keys) || 0));
   const notes = [];
   for (const o of parsed.objects) {
     if (o.spinner) continue;
-    const column = clamp(Math.floor((o.x * keys) / 512), 0, keys - 1);
+    const raw = clamp(Math.floor((o.x * keys) / 512), 0, keys - 1);
+    // Column-changing mods are applied in display space here: the renderer always draws
+    // the displayed chart, and inputs (helper keys / .osr actions) are mapped back with
+    // sourceColumn(). See docs/stable-mania-random.md.
+    const column = displayColumn(raw);
     const endTime = o.hold ? Math.max(o.time, o.endTime === undefined ? o.time : o.endTime) : o.time;
-    notes.push({ column, time: o.time, endTime, hold: !!o.hold && endTime > o.time });
+    notes.push({ column, raw, time: o.time, endTime, hold: !!o.hold && endTime > o.time });
   }
   notes.sort((a, b) => a.time - b.time);
   return {
@@ -825,12 +1166,16 @@ function updateKeyHints(keys) {
   else if (Array.isArray(keys.maniaKeys)) slots = keys.maniaKeys;
   else if (keys.k1 || keys.k2 || keys.m1 || keys.m2) slots = [keys.k1, keys.k2, keys.m1, keys.m2];
   if (!slots || !slots.length) return;
+  // Slot i is the i-th physical key and the chart is drawn in display space, so the slot
+  // index is already the displayed column.
+  const hintColumn = (slot) => slot;
   if (Array.isArray(keys) || Array.isArray(keys.maniaKeys)) {
     state.keyHintSlotCount = slots.length;
-    for (let i = 0; i < slots.length; i++) state.keyHintExposed[i] = true;
+    for (let i = 0; i < slots.length; i++) state.keyHintExposed[hintColumn(i)] = true;
   } else if (state.keyHintSlotCount === 0) {
     state.keyHintSlotCount = 4;
-    state.keyHintExposed = [true, true, true, false];
+    state.keyHintExposed = [];
+    for (let i = 0; i < 4; i++) state.keyHintExposed[hintColumn(i)] = i < 3;
   }
   while (state.keyHintPressed.length < slots.length) {
     state.keyHintPressed.push(false);
@@ -843,15 +1188,15 @@ function updateKeyHints(keys) {
     const count = num(btn.count, 0);
     if (count > state.keyHintCounts[i]) {
       const delta = Math.min(16, count - state.keyHintCounts[i]);
-      for (let d = 0; d < delta; d++) pushKeyHint(i, "press");
-      state.keyHintExposed[i] = true;
+      for (let d = 0; d < delta; d++) pushKeyHint(hintColumn(i), "press");
+      state.keyHintExposed[hintColumn(i)] = true;
       state.keyHintSeen = true;
     } else if (pressed && !state.keyHintPressed[i]) {
-      pushKeyHint(i, "press");
-      state.keyHintExposed[i] = true;
+      pushKeyHint(hintColumn(i), "press");
+      state.keyHintExposed[hintColumn(i)] = true;
       state.keyHintSeen = true;
     }
-    if (!pressed && state.keyHintPressed[i]) pushKeyHint(i, "release");
+    if (!pressed && state.keyHintPressed[i]) pushKeyHint(hintColumn(i), "release");
     state.keyHintPressed[i] = pressed;
     state.keyHintCounts[i] = count;
   }
@@ -1455,7 +1800,13 @@ function exactOffsetFor(actions) {
   if (!sorted.length) return fit;
   for (let i = 0; i < sorted.length; i++) sorted[i].index = i;
   const evaluate = (off) => {
-    const acts = sorted.map((a) => ({ column: a.column, time: a.time + off, endTime: a.endTime + off, index: a.index, related: -1 }));
+    const acts = sorted.map((a) => ({
+      column: a.column,
+      time: a.time + off,
+      endTime: a.endTime + off,
+      index: a.index,
+      related: -1
+    }));
     const res = judgeReplayNotes(map.notes, acts, w, sv2, true);
     const counts = replayJudgementCounts(map.notes, res, sv2);
     let l1 = 0;
@@ -1492,7 +1843,13 @@ function applyExactTimeline(actions, offset) {
   resetJudgements();
   const w = replayWindowTable(!!state.scoreV2);
   const sorted = actions
-    .map((a, i) => ({ column: a.column, time: a.time + offset, endTime: a.endTime + offset, index: i, related: -1 }))
+    .map((a, i) => ({
+      column: a.column,
+      time: a.time + offset,
+      endTime: a.endTime + offset,
+      index: i,
+      related: -1
+    }))
     .filter((a) => Number.isFinite(a.time) && Number.isFinite(a.endTime) && Number.isInteger(a.column) && a.column >= 0 && a.column < map.keys)
     .sort((x, y) => x.time - y.time);
   if (!sorted.length) return false;
@@ -1613,6 +1970,9 @@ async function maybeExact() {
   const token = state.loadToken;
   let found = null;
   let foundCounts = null;
+  let foundSeed = null;
+  let foundLazerSeed = null;
+  let foundMods = null;
   let ok = false;
   try {
     const res = await helperFetch(helperEndpoint(`/replay?md5=${state.checksum}&keys=${state.beatmap.keys}`), 3000);
@@ -1620,6 +1980,9 @@ async function maybeExact() {
     if (data && data.found && Array.isArray(data.actions)) {
       found = data.actions;
       foundCounts = Array.isArray(data.counts) ? data.counts : null;
+      foundSeed = Number.isFinite(Number(data.seed)) ? Number(data.seed) : null;
+      foundLazerSeed = Number.isFinite(Number(data.lazerSeed)) ? Number(data.lazerSeed) : null;
+      foundMods = Number(data.mods) || 0;
     }
     ok = true;
   } catch {
@@ -1629,6 +1992,58 @@ async function maybeExact() {
   if (token !== state.loadToken) return;
   if (ok) state.helperState = "ready";
   if (ok && found) {
+    if (!state.random && (Number(foundMods) & (1 << 21)) !== 0) {
+      // The .osr itself says the play used RD (tosu may not report mods during replay
+      // playback): keep the mapping on for as long as this chart is loaded.
+      state.randomForced = true;
+      state.random = true;
+    }
+    if (state.random) {
+      const keys = state.beatmap ? state.beatmap.keys : 4;
+      const stableSeed = foundSeed !== null && foundSeed > 0 ? foundSeed : null;
+      const lazerSeed = foundLazerSeed !== null && foundLazerSeed > 0 ? foundLazerSeed : null;
+      const seedKind = lazerSeed !== null ? "lazer" : stableSeed !== null ? "stable" : null;
+      const usableSeed = lazerSeed !== null ? lazerSeed : stableSeed;
+      if (usableSeed !== null) {
+        if (usableSeed !== state.seed || state.seedKind !== seedKind || state.rdColumns || !Number.isFinite(state.seed)) {
+          // RD: the .osr seed decides the column shuffle, so the chart has to be rebuilt
+          // with the real mapping before any replay judgement is computed.
+          state.seed = usableSeed;
+          state.seedKind = seedKind;
+          state.rdColumns = null;
+          state.rdSamples = [];
+          rebuildColumnMap(keys);
+          state.loadedKey = "";
+          await ensureBeatmap();
+          if (token !== state.loadToken) return;
+        }
+      } else {
+        // No usable seed: osu!lazer's exporter writes 0, and replays before 20130319 have
+        // no seed frame at all. Reconstruct the shuffle from the recorded presses.
+        // The chart has to be back in beatmap space first, otherwise a mapping applied
+        // earlier (live inference) would make the reconstruction compare against itself.
+        if (state.seed !== null || state.rdColumns) {
+          state.seed = null;
+          state.seedKind = null;
+          state.rdColumns = null;
+          rebuildColumnMap(keys);
+          state.loadedKey = "";
+          await ensureBeatmap();
+          if (token !== state.loadToken) return;
+        }
+        const inferred = state.beatmap
+          ? inferColumnPermutation(state.beatmap.notes, found, keys)
+          : null;
+        state.seed = null;
+        state.seedKind = null;
+        state.rdColumns = inferred;
+        state.rdSamples = [];
+        rebuildColumnMap(keys);
+        state.loadedKey = "";
+        await ensureBeatmap();
+        if (token !== state.loadToken) return;
+      }
+    }
     state.exactKey = key;
     state.exactActions = found;
     state.exactCounts = foundCounts;
@@ -1720,6 +2135,11 @@ function lockLivePoint(column, t, wantEnd) {
 function applyLiveKey(column, t, down) {
   const w = state.windows || localWindows();
   if (!state.points || !w || !w.length) return;
+  // The helper reports physical key indices, which are the displayed chart columns: the
+  // chart itself is built in display space (Mirror / Random applied by buildManiaNotes),
+  // so it must not be translated again here. While RD is still unknown this call feeds
+  // the live permutation inference.
+  sampleLiveRandom(column, t);
   const best = lockLivePoint(column, t, !down);
   if (best < 0) return;
   const point = state.points[best];
@@ -2009,7 +2429,7 @@ async function fetchBeatmapText() {
 async function ensureBeatmap() {
   const identity = state.checksum || (state.beatmapFolder && state.beatmapFileName ? `${state.beatmapFolder}/${state.beatmapFileName}` : "");
   if (!identity || state.mapMode !== "mania") return;
-  const key = `${identity}|${state.mapMode}|${state.csConverted}`;
+  const key = `${identity}|${state.mapMode}|${state.csConverted}|${columnMapKey()}`;
   if (state.loadedKey === key) return;
   if (state.pendingKey === key) return;
   if (state.retryKey === key && performance.now() < state.retryAt) return;
@@ -2403,7 +2823,26 @@ function renderScene(ctx, t) {
 }
 
 const canvas = document.getElementById("preview");
-const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
+let ctx = canvas.getContext("2d", { alpha: true });
+// Chromium can drop the backing store of a 2D canvas while the page is hidden (osu! in the
+// background hides the tosu overlay surface), which used to leave the overlay blank until the
+// next note redraw. Re-acquire the context on restore and repaint right away.
+function resetCanvasContext() {
+  ctx = canvas.getContext("2d", { alpha: true });
+  lastDrawRev = "";
+  lastPaddedView = null;
+  wasVisible = false;
+}
+function addCanvasHook(name, handler) {
+  if (typeof canvas.addEventListener === "function") canvas.addEventListener(name, handler);
+}
+addCanvasHook("contextlost", (event) => {
+  if (event && typeof event.preventDefault === "function") event.preventDefault();
+  lastDrawRev = "";
+  lastPaddedView = null;
+  wasVisible = false;
+});
+addCanvasHook("contextrestored", () => resetCanvasContext());
 const statusEl = document.getElementById("status");
 let lastWidth = 0;
 let lastHeight = 0;
@@ -2411,6 +2850,9 @@ let wasVisible = false;
 
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  // A hidden WebView2 / OBS surface reports a 0x0 viewport. Shrinking the canvas to 1x1 there
+  // wiped the last frame, so keep the previous size until a real viewport comes back.
+  if (window.innerWidth < 2 || window.innerHeight < 2) return;
   const width = Math.max(1, Math.floor(window.innerWidth * dpr));
   const height = Math.max(1, Math.floor(window.innerHeight * dpr));
   if (width !== lastWidth || height !== lastHeight) {
@@ -2441,34 +2883,147 @@ function currentViewport(width, height) {
 }
 
 let lastFrameAt = 0;
+let lastPaintAt = 0;
 let lastPaddedView = null;
 let lastDrawRev = "";
+// Diagnostics: why the canvas was not repainted on the last frame (shown in #status).
+let lastSkip = "";
+let contextLostSince = 0;
+let canvasRecoveries = 0;
+
+// Screen capture tools (QQ's Ctrl+Alt+A, OBS previews, Windows Game Bar) can tear the overlay's
+// GPU surface down. Chromium then keeps the 2D context in a "lost" state where every draw call
+// is silently ignored and no contextrestored event tends to arrive for this kind of surface.
+// Reset the backing store and re-acquire the context so the overlay can heal itself.
+let canaryFails = 0;
+let lastCanaryAt = 0;
+
+// Draw one pixel and read it back: a lost context (or a surface the compositor no longer shows)
+// silently swallows every command, so pixels are the only reliable liveness probe.
+function canvasCanary() {
+  if (typeof HTMLCanvasElement === "undefined") return true;
+  if (typeof ctx.getImageData !== "function") return true;
+  const now = performance.now();
+  if (lastCanaryAt && now - lastCanaryAt < 1000) return canaryFails === 0;
+  lastCanaryAt = now;
+  let ok = true;
+  try {
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#010101";
+    ctx.fillRect(0, 0, 1, 1);
+    const data = ctx.getImageData(0, 0, 1, 1).data;
+    ok = !!data && data[3] > 0;
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.restore();
+  } catch (err) {
+    ok = false;
+  }
+  canaryFails = ok ? 0 : canaryFails + 1;
+  return ok;
+}
+
+// Nudge the compositor into rebuilding the overlay's layer and, if that is not enough, replace
+// the canvas element with a fresh one so WebView2 has to allocate a new surface.
+function healCanvas() {
+  const w = Math.max(8, canvas.width);
+  const h = Math.max(8, canvas.height);
+  try {
+    canvas.style.display = "none";
+    void canvas.offsetHeight;
+    canvas.style.display = "block";
+  } catch (err) {}
+  canvas.width = w;
+  canvas.height = h;
+  ctx = canvas.getContext("2d", { alpha: true });
+  lastWidth = w;
+  lastHeight = h;
+  lastDrawRev = "";
+  lastPaddedView = null;
+  wasVisible = false;
+  contextLostSince = 0;
+  canvasRecoveries += 1;
+}
+
+function recoverCanvasIfNeeded() {
+  const isLost = typeof ctx.isContextLost === "function" && ctx.isContextLost();
+  if (!isLost) {
+    contextLostSince = 0;
+    return false;
+  }
+  const now = performance.now();
+  if (!contextLostSince) contextLostSince = now;
+  if (now - contextLostSince < 400) return true;
+  const w = Math.max(8, canvas.width);
+  const h = Math.max(8, canvas.height);
+  canvas.width = w;
+  canvas.height = h;
+  ctx = canvas.getContext("2d", { alpha: true });
+  lastDrawRev = "";
+  lastPaddedView = null;
+  wasVisible = false;
+  contextLostSince = 0;
+  canvasRecoveries += 1;
+  return false;
+}
 
 function allowedState() {
   return state.gameState === "play" && state.mapMode === "mania";
 }
 
+// Temporary diagnostics: the status line is the only channel visible inside the tosu
+// ingame overlay, so keep it reporting why the canvas may be empty.
+function debugTag() {
+  const age = lastPaintAt ? Math.round(performance.now() - lastPaintAt) : -1;
+  const size = state.beatmap && state.beatmap.notes ? state.beatmap.notes.length : -1;
+  return [
+    "dbg 0.5.4-focus5",
+    state.gameState || "no-state",
+    `${Math.round(canvas.width)}x${Math.round(canvas.height)}`,
+    `win ${Math.round(window.innerWidth)}x${Math.round(window.innerHeight)}`,
+    `notes ${size}`,
+    state.beatmap ? "chart" : "nochart",
+    state.loadError ? `err:${state.loadError}` : "",
+    `stale ${state.streamStale ? 1 : 0}`,
+    `paint ${age}ms`,
+    `ctx ${ctx ? "ok" : "null"} · skip ${lastSkip || "-"} · rec ${canvasRecoveries} · canary ${canaryFails}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function wantsDebug() {
+  try {
+    return typeof location !== "undefined" && /[?&]debug\b/.test(String(location.search || ""));
+  } catch {
+    return false;
+  }
+}
+
+// The overlay status line is a single, minimal hint: whether the helper keyboard hook is
+// currently feeding precise judgements. The long diagnostic string stays available behind
+// ?debug=1 for troubleshooting.
 function statusText() {
-  if (!state.gameState) return "waiting for tosu...";
-  if (state.gameState !== "play") return "";
-  if (state.streamStale) return "tosu stream stalled, waiting for data...";
-  if (state.mapMode !== "mania") return "mania only";
-  if (!state.beatmap) {
-    if (state.loadError) return `beatmap fetch failed: ${state.loadError} (retrying)`;
-    return "loading beatmap...";
-  }
-  if (state.exactApplied) return "exact: replay";
-  if (state.liveActive) return state.helperLayout ? `exact: live (${state.helperLayout})` : "exact: live";
-  if (helperBase() && (settings.exactReplay || settings.exactLive)) {
-    if (state.helperState === "error" || state.helperState === "off") return "exact: helper offline (run tools/mrm-helper.mjs)";
-    if (state.helperHookError) return `exact: hook unavailable (${state.helperHookError})`;
-    return "exact: waiting";
-  }
-  return "";
+  const hookOn = !!(state.liveReady && !state.helperHookError);
+  const text = `helper hook: ${hookOn ? "on" : "off"}`;
+  if (!wantsDebug()) return text;
+  return `${text}\n${debugTag()}`;
+}
+let frameQueued = false;
+// One queued animation frame at a time: wake-up handlers may call frame() directly, and
+// requestAnimationFrame(frame) on every entry would stack a new render loop per call.
+function scheduleFrame() {
+  if (frameQueued) return;
+  frameQueued = true;
+  requestAnimationFrame(() => {
+    frameQueued = false;
+    frame();
+  });
 }
 
 function frame() {
-  requestAnimationFrame(frame);
+  scheduleFrame();
   const nowMs = performance.now();
   // A short tosu hiccup must not wipe the judgements on screen: mark the stream stale
   // (rendering freezes on the last sample) and resume as soon as v2 comes back.
@@ -2479,17 +3034,46 @@ function frame() {
     sweepMisses(renderTime());
   }
   const fpsLimit = clamp(num(settings.fpsLimit, 0), 0, 1000);
-  if (fpsLimit > 0 && nowMs - lastFrameAt < 1000 / fpsLimit - 1) return;
+  if (fpsLimit > 0 && nowMs - lastFrameAt < 1000 / fpsLimit - 1) {
+    lastSkip = "fps";
+    return;
+  }
   lastFrameAt = nowMs;
 
   resize();
-  const width = canvas.width;
-  const height = canvas.height;
+  let width = canvas.width;
+  let height = canvas.height;
   const text = statusText();
   if (statusEl.textContent !== text) statusEl.textContent = text;
 
+  if (width < 8 || height < 8) {
+    // A collapsed surface may leave a stale 1x1 backing store: re-measure once from the viewport.
+    lastWidth = 0;
+    lastHeight = 0;
+    resize();
+    width = canvas.width;
+    height = canvas.height;
+    if (width < 8 || height < 8) {
+      lastSkip = "small-canvas";
+      return;
+    }
+  }
+
+  if (recoverCanvasIfNeeded()) {
+    lastSkip = "ctx-lost";
+    return;
+  }
+
+  if (!canvasCanary()) {
+    // Two failed probes in a row mean the context/surface is gone: rebuild it and repaint.
+    if (canaryFails >= 2) healCanvas();
+    lastSkip = `canary-fail${canaryFails}`;
+    return;
+  }
+
   const hasChart = state.beatmap && state.beatmap.notes && state.beatmap.notes.length > 0;
   if (!allowedState() || !hasChart) {
+    lastSkip = `blank:${state.gameState || "?"}:${hasChart ? 1 : 0}`;
     if (wasVisible) {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, width, height);
@@ -2502,9 +3086,16 @@ function frame() {
 
   const t = renderTime();
   const rev = `${t.toFixed(3)}|${state.beatmap.keys}|${state.errorCount}|${state.windows ? state.windows.join(",") : ""}|${settings.playfieldOpacity}|${settings.renderScale}|${settings.backgroundOpacity}|${settings.backgroundColor}|${settings.noteHeight}|${settings.noteStroke}|${settings.actionHeight}|${settings.hitPosition}|${settings.hitLineWidth}|${settings.reviewTime}|${settings.statsScale}|${settings.showActions}|${settings.showStats}|${settings.showHitLine}|${settings.colorUnjudged}|${settings.colorLongNote}|${settings.colorPerfect}|${settings.colorGreat}|${settings.colorGood}|${settings.colorOk}|${settings.colorMeh}|${settings.colorMiss}|${settings.maniaScrollSpeedOverride}|${settings.showHitLine}|${state.cached ? 1 : 0}${state.exactApplied ? 1 : 0}|${width}|${height}`;
-  if (rev === lastDrawRev) return;
+  // Even when nothing changed, repaint once a second: a canvas whose backing store was
+  // discarded (hidden page / GPU reset) otherwise stays blank until the next judgement.
+  if (rev === lastDrawRev && nowMs - lastPaintAt < 1000) {
+    lastSkip = "dedupe";
+    return;
+  }
   lastDrawRev = rev;
+  lastPaintAt = nowMs;
   wasVisible = true;
+  lastSkip = "drawn";
 
   const bgOpacity = clamp(num(settings.backgroundOpacity, 0), 0, 1);
   const view = currentViewport(width, height);
@@ -2581,6 +3172,12 @@ function handleGameStateChange(stateName) {
     state.hits = null;
     state.accuracy = 100;
     state.lastLive = NaN;
+    // A new play must not inherit the previous RD shuffle.
+    state.seed = null;
+    state.seedKind = null;
+    state.rdColumns = null;
+    state.rdSamples = [];
+    state.randomForced = false;
     resetExactRun();
     resetJudgements();
   } else if (stateName !== "play" && state.gameState === "play") {
@@ -2607,6 +3204,16 @@ function applyMods(mods) {
   const acronyms = arr.map((m) => (m && m.acronym ? String(m.acronym).toUpperCase() : ""));
   state.scoreV2 = (Number(mods.number) & (1 << 29)) !== 0 || acronyms.includes("V2") || acronyms.includes("SV2");
   state.classicMod = state.client !== "lazer" || acronyms.includes("CL");
+  // Mirror (MR) is bit 30 in the stable mod bitmask, Random (RD) is bit 21. Newer tosu
+  // may only send the acronym, so both forms are accepted.
+  state.mirror =
+    (state.modsNumber & (1 << 30)) !== 0 || acronyms.includes("MR") || acronyms.includes("MIRROR");
+  const detectedRandom =
+    (state.modsNumber & (1 << 21)) !== 0 || acronyms.includes("RD") || acronyms.includes("RANDOM");
+  // A replay's .osr can carry the RD bit even when tosu does not report mods while the
+  // replay is being watched, so an exact replay that needs RD can force the mapping on.
+  state.random = detectedRandom || state.randomForced;
+  rebuildColumnMap(state.beatmap ? state.beatmap.keys : Math.round(state.csConverted || 4));
 }
 
 function applyStats(stats) {
@@ -2804,6 +3411,43 @@ window.addEventListener("beforeunload", () => {
 // Closing sockets explicitly keeps tosu from logging dropped clients on page unload.
 window.addEventListener("pagehide", () => sockets.closeAll());
 
+// Coming back from the background must not depend on the animation frame that may have been
+// throttled or dropped: repaint immediately and, if the sockets died while hidden, reconnect.
+function wakeUpRendering() {
+  lastDrawRev = "";
+  lastPaddedView = null;
+  wasVisible = false;
+  resize();
+  for (const path of ["/websocket/v2", "/websocket/v2/precise", "/websocket/commands"]) {
+    if (!sockets.sockets[path]) {
+      // The manager re-applies filters/reopeners itself when the socket comes back.
+      sockets.open(path, path === "/websocket/v2" ? onV2 : path === "/websocket/v2/precise" ? onPrecise : onCommand, path === "/websocket/v2" ? v2Filters : undefined, path === "/websocket/commands" ? () => requestSettings() : undefined);
+    }
+  }
+  frame();
+}
+function addWindowHook(name, handler) {
+  if (window && typeof window.addEventListener === "function") window.addEventListener(name, handler);
+}
+addWindowHook("resize", wakeUpRendering);
+addWindowHook("focus", wakeUpRendering);
+addWindowHook("pageshow", wakeUpRendering);
+if (document && typeof document.addEventListener === "function") {
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) wakeUpRendering();
+  });
+}
+
+// Watchdog: screen-capture tools (QQ's Ctrl+Alt+A, Game Bar, OBS previews) can stall the
+// animation-frame loop without any visibility change and without waking the page. A slow timer
+// keeps forcing repaints so the overlay comes back on its own.
+if (typeof setInterval === "function") {
+  const paintWatchdog = setInterval(() => {
+    if (performance.now() - lastPaintAt > 1200) frame();
+  }, 500);
+  if (paintWatchdog && typeof paintWatchdog.unref === "function") paintWatchdog.unref();
+}
+
 window.__maniaReplayMaster = {
   state,
   settings,
@@ -2814,6 +3458,7 @@ window.__maniaReplayMaster = {
   visibleStartIndex,
   localWindows,
   updateWindows,
+  applyMods,
   classifyError,
   effectiveTimeRange,
   buildPoints,
@@ -2833,6 +3478,14 @@ window.__maniaReplayMaster = {
   judgeReplayNotes,
   replayJudgementCounts,
   classifyV2Tail,
+  dotNetRandom,
+  rdShuffledColumns,
+  lazerShuffledColumns,
+  inferColumnPermutation,
+  displayColumn,
+  sourceColumn,
+  columnMapKey,
+  rebuildColumnMap,
   applyExactTimeline,
   applyExactData,
   maybeExact,
@@ -2867,4 +3520,4 @@ window.__maniaReplayMaster = {
   sockets
 };
 
-requestAnimationFrame(frame);
+scheduleFrame();

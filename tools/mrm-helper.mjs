@@ -187,6 +187,33 @@ function rateFromMods(mods) {
   return 1;
 }
 
+// osu!lazer appends a second LZMA block after the replay stream: a JSON dump of
+// LegacyReplaySoloScoreInfo. It carries the score's mod settings - including the
+// mania Random seed, which cannot fit in the legacy `-12345|0|0|<seed>` frame.
+// osu!stable files only have the 8-byte LegacyOnlineID after the stream (all zero).
+function readScoreInfoBlock(buf, offset) {
+  let p = offset + 8;
+  if (p + 4 > buf.length) return null;
+  const len = buf.readInt32LE(p);
+  p += 4;
+  if (len <= 16 || p + len > buf.length) return null;
+  try {
+    const json = String(LZMA.decompress(new Uint8Array(buf.buffer, buf.byteOffset + p, len)));
+    if (!json || json.length > MAX_REPLAY_TEXT) return null;
+    const info = JSON.parse(json);
+    const mods = Array.isArray(info.mods) ? info.mods : [];
+    const rd = mods.find((m) => m && /^(RD|RANDOM)$/i.test(String(m.acronym || "")));
+    const settings = rd && rd.settings && typeof rd.settings === "object" ? rd.settings : null;
+    const seed = settings && Number.isFinite(Number(settings.seed)) ? Number(settings.seed) : null;
+    return {
+      seed,
+      mods: mods.map((m) => (m && m.acronym ? String(m.acronym) : "")).filter(Boolean)
+    };
+  } catch {
+    return null;
+  }
+}
+
 function parseOsr(filePath) {
   const buf = fs.readFileSync(filePath);
   let o = 0;
@@ -213,11 +240,28 @@ function parseOsr(filePath) {
   o += 4;
   const blob = new Uint8Array(buf.buffer, buf.byteOffset + o, replayLen);
   if (!blob.length) return null;
+  const scoreInfo = readScoreInfoBlock(buf, o + replayLen);
   // A corrupted or truncated stream can decompress into an enormous string; refuse it
   // instead of exhausting the heap, and let /replay answer found:false.
   const text = String(LZMA.decompress(blob));
   if (!text || text.length > MAX_REPLAY_TEXT) return null;
-  return { md5: md5.value, player: player.value, counts, score, mods, text };
+  return { md5: md5.value, player: player.value, counts, score, mods, text, scoreInfo };
+}
+
+// The last replay frame is `-12345|0|0|<seed>`: osu!stable stores the RNG seed it used
+// for the mania Random (RD) shuffle there. See docs/stable-mania-random.md.
+function seedFromText(text) {
+  for (const frame of String(text).split(",")) {
+    const p = frame.split("|");
+    if (p.length < 4) continue;
+    if (parseInt(p[0], 10) !== -12345) continue;
+    const seed = parseInt(p[3], 10);
+    // osu!lazer's legacy exporter always writes `-12345|0|0|0` (the seed never makes it
+    // into the exported .osr), so 0 means "unknown", not a real RNG seed.
+    if (!Number.isFinite(seed) || seed === 0) return null;
+    return seed;
+  }
+  return null;
 }
 
 function extractActions(text, keys, pressOffset = 0) {
@@ -346,7 +390,8 @@ function readReplayFile(file) {
     rate: rateFromMods(osr.mods),
     counts: osr.counts,
     scoreV2: (osr.mods & (1 << 29)) !== 0,
-    text: osr.text
+    text: osr.text,
+    scoreInfo: osr.scoreInfo
   };
   while (osrCache.size > 24) {
     const oldest = osrCache.keys().next().value;
@@ -658,6 +703,9 @@ const server = http.createServer((req, res) => {
       rate: data.rate,
       counts: data.counts,
       scoreV2: data.scoreV2,
+      seed: seedFromText(data.text),
+      lazerSeed: data.scoreInfo ? data.scoreInfo.seed : null,
+      lazerMods: data.scoreInfo ? data.scoreInfo.mods : null,
       keys,
       actions
     }));

@@ -3,3 +3,7 @@
 Thumbs.db
 .DS_Store
 node_modules/
+ln-logs/
+.tmp*/
+.tmp*.mjs
+*.log

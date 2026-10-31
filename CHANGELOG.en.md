@@ -1,4 +1,19 @@
-# Mania Replay Master v0.5.4 — Update Notes (unreleased)
+# Mania Replay Master v0.5.5 — Update Notes
+
+**Minor update**: Mirror / Random mod support, a fix for the overlay going blank after switching apps or taking a QQ screenshot, a compact status line, and a cleanup of development-only scripts and internal review notes.
+
+- **Mirror (MR) support**: the `1 << 30` bit and the `MR` acronym now flip note columns, key columns, key hints and `.osr` action columns, so a mirrored beatmap is no longer drawn reversed (previously whole rows were judged as misses).
+- **Random (RD) with seedless `.osr`**: osu!lazer's legacy exporter always writes `-12345|0|0|0` (the seed never reaches the legacy format) and pre-20130319 replays have no such frame; the plugin now reconstructs the column permutation from the recorded presses instead (column-count pruning + timing match + uniqueness threshold). Verified on six real RD replays.
+- **Random (RD) support**: in Replay mode the seed is read from the trailing `.osr` frame `-12345|0|0|<seed>` and the column permutation is rebuilt with .NET `System.Random` rejection sampling — L1 distance between the rebuilt judgement counts and the game result is 0–18 on seven real replays. Without a `.osr` (Live mode), the permutation is inferred from the first ~48 key presses (locked in about 8–10 seconds). See [docs/stable-mania-random.md](docs/stable-mania-random.md) for the algorithm and test vectors other overlays/tools can reuse.
+- **Overlay self-healing**: switching away from osu! or using QQ's Ctrl+Alt+A screenshot drops the overlay surface and the canvas backing store; a 1s heartbeat repaint, `contextlost` / `contextrestored` handling, `focus` / `pageshow` / `visibilitychange` wake-ups plus a canvas probe/rebuild now recover it without restarting the play.
+- **Compact status line**: the overlay only shows `helper hook: on|off`; the long diagnostics move behind `?debug=1`.
+- **helper**: the `/replay` response now carries `seed` / `lazerSeed` / `lazerMods` (used by Random).
+- **lazer RD seed**: lazer-exported `.osr` files always write `-12345|0|0|0`, but they append a `LegacyReplaySoloScoreInfo` block whose `mods[].settings.seed` holds the real seed. The helper now reads it, and the plugin rebuilds the shuffle with lazer's `OrderBy(rng.Next())` algorithm (different from stable's rejection sampling), falling back to inference only when neither is available.
+- **Cleanup**: development-only recording/analysis scripts and internal review notes were removed; the repository keeps the runtime plugin code plus the unit test suite.
+
+Tests: `node test/mrm-test.mjs` 144/144 (including Mirror / Random / lazer seed).
+
+# Mania Replay Master v0.5.4 — Update Notes
 
 This release rewrites the judgement model of the **Replay** path (the exact pipeline that reads `.osr`). Previously the replay colours drifted far from the osu! score screen, especially on long notes (whole LN recoloured, head/tail swapped, dense LN sections tinted one row after another).
 
@@ -15,6 +30,10 @@ Measured on the same 4K LN map (OD8) against the osu! result counts: V1 L1 dista
 - **Joint error pairing**: `hitErrors` are no longer paired by "closest error value" (dense LN sections repeat errors and shift the pairing), but by implied press time plus error value, so whole rows no longer flip class.
 - **V1 merge rule matches the client**: `|head error| + |tail error| <= window*rate*2` (rate 1.2/1.1), and a release way too early is a miss.
 - **30ms miss grace**: late `hitErrors` / key events can still claim a note at the window edge.
+- **No more blank overlay after alt-tab**: while osu! is in the background the tosu surface collapses to `0x0` and Chromium drops the canvas contents, while the frozen song clock kept the redraw dedupe key identical. The overlay now repaints at least once per second, re-acquires the 2D context on `contextlost`/`contextrestored`, wakes up on `focus`/`pageshow`/`visibilitychange` and reopens sockets that died while hidden.
+- **Mirror (MR) support**: the Mirror bit / `MR` acronym now flips note columns, key columns and `.osr` action columns, so a mirrored chart no longer renders with every lane reversed.
+- **Random (RD) support**: the run seed is read from the `.osr` trailing `-12345|0|0|<seed>` frame and the column shuffle is rebuilt with .NET `System.Random` rejection sampling (instant for replays); while playing (no `.osr` yet) the permutation is inferred from the first ~48 presses (~8-10s to lock). Six real RD replays now reproduce the score counts within L1 0-18. See `docs/stable-mania-random.md` for other plugins/tools.
+- **Leaner status line**: the overlay only shows `helper hook: on|off`; the long diagnostics string moved behind `?debug=1`.
 
 - **ScoreV2 mass revert fixed**: ScoreV2 recalculates the score on every judgement, so releasing a hold early (re-judged as a miss) makes `play.score` dip slightly. The old restart detector treated that as a retry and called `resetJudgements()`, reverting every rendered note (including unrelated nearby LNs) to the unjudged colour. Restart detection now only looks at the hit counters (31 false resets per 164s run -> 0).
 - **ScoreV2 hold release fixed**: the client divides the release offset by 1.5 before comparing it with the windows, and caps the tail at MEH when the head was missed; we compared the raw offset, so dense LN tails came out one class too harsh. Live counts vs the result now differ by L1 106 (was 620), notes with a different tail class 656 -> 182.
@@ -41,7 +60,7 @@ Measured on the same 4K LN map (OD8) against the osu! result counts: V1 L1 dista
 
 Measured by replaying the same V1 recording against the game result: live note-level L1 448 → 68, notes with a different head class 1195 → 264 (tails 884 → 194), `|dE| <= 5ms` 5.7% → 80.3%, colour latency p95 171.4 → 111.2ms.
 
-Tests: 112/112 unit assertions pass; `node test/ln-analyze.mjs --session ln-logs/session-v1-1` and `--session ln-logs/session-ln3` reproduce the numbers above.
+Tests: 112/112 unit assertions pass; `test/ln-analyze.mjs`（开发期脚本，已移除） and `--session ln-logs/session-ln3` reproduce the numbers above.
 
 ---
 

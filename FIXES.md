@@ -1,7 +1,7 @@
 # 修复记录（相对上游 0.5.0）
 
-本目录 `Mania Replay Master (fixed)` 是代码审查后的修复版本，版本号 0.5.4（基于上游 0.5.0；0.5.4 重写了回放判定模型并修复实时判定归属，见第 19、20 条）。
-以下按审查发现的问题逐条对应修改，测试为 `node test/mrm-test.mjs`（92/92 通过）。
+本目录 `Mania Replay Master (fixed)` 是代码审查后的修复版本，版本号 0.5.5（基于上游 0.5.0；0.5.4 重写了回放判定模型并修复实时判定归属，0.5.5 加入 Mirror / Random mod 支持、覆盖层自愈与状态行精简）。
+以下按审查发现的问题逐条对应修改，测试为 `node test/mrm-test.mjs`（144/144 通过）。
 
 ## P0 安全
 
@@ -188,7 +188,7 @@
   - 新增 `judgeReplayNotes()`：按列先进先出扫描、`TOO_EARLY` / `TOO_LATE` 语义、长条「同列下一个 note 覆盖的过晚判定」「hold 过长的反向扫描」等规则；V1 长条由 `judgeRelease()` 给出**头尾合并**的单一判定（`totalDiff <= window*rate*2`，rate 1.2/1.1/1.0），ScoreV2 头尾分开且「头判未命中/已 miss 时尾判降为 MEH」，与 stable 一致。
   - `applyExactTimeline()` 改为用该模型直接写入 `points` / `noteState`（V1 整根同色、ScoreV2 头尾分色），未命中的 note 统一按 miss 上色，不再依赖 `lockPoint()` 与超时 `sweepMisses()`。
   - 新增 `exactOffsetFor()`：先用 `fitExactOffset()` 粗估，再用 helper `/replay` 返回的 `.osr` 计数在 ±80ms 内逐毫秒最小化计数偏差，自动定标（实测稳定收敛到 -2629）；helper 的 `/replay` 增加可选 `file=` 参数以便精确指定哪一局回放（同一张图多局 `.osr` 时不再取错）。
-- 验证（`node test/ln-analyze.mjs`，真实录制 + 真实 `.osr`）：
+- 验证（`test/ln-analyze.mjs`（开发期脚本，已移除），真实录制 + 真实 `.osr`）：
   - V1 局（`ln-logs/session-v1-1`）：note 级 `1265/998/105/11/6/2`，游戏 `1264/997/102/13/6/5`，**L1 890 → 10**。
   - ScoreV2 局（`ln-logs/session-ln3`）：点级 `2346/1317/245/20/5/10`，游戏 `2342/1315/245/17/8/16`，**L1 618 → 18**。
   - `node test/mrm-test.mjs` 92/92 通过；离线渲染冒烟（exact 应用后连续 `frame()`）无异常。
@@ -207,7 +207,7 @@
   - `correctLiveError()` 改为「隐含按键时间 + 误差值」联合打分（时间权重 0.25），不再单纯按误差值最近配对；失败时才退回最近误差。
   - `classifyLongNote()` / `settleV1LongNote()` 改为客户端的合并规则：`totalDiff = |头误差| + |尾误差|`，`totalDiff <= 窗口*rate*2`（rate 1.2/1.1/1.0），尾判早放超过 miss 窗口判 miss。
   - `sweepMisses()` 增加 30ms 宽限，等迟到的 hitError/按键事件。
-- 验证（`node test/ln-analyze.mjs`，同一份 V1 录制回放，对比游戏结算）：
+- 验证（`test/ln-analyze.mjs`（开发期脚本，已移除），同一份 V1 录制回放，对比游戏结算）：
   - note 级 live 分布 `1052/990/155/59/131/0`（L1 448）→ `1273/964/117/14/15/4`（**L1 68**）；游戏 `1264/997/102/13/6/5`，回放（exact）`1265/998/105/11/6/2`（L1 10）。
   - 头判类不同的 note 1195 → 264，尾判 884 → 194；`|dE| <= 5ms` 5.7% → 80.3%，`|dE| > 50ms` 222 → 70（1.8%）；着色延迟 p95 171.4 → 111.2ms；miss 延迟中位 -232.4 → 24.8ms。
   - ScoreV2 录制同样回放：头判类不同 507 → 377，回放侧 L1 仍是 18（无回退）。
@@ -322,6 +322,68 @@
 - 工具与文档：`stop-helper.bat` 统计进程数并如实输出 "not running" / "stopped (N process(es))"；`README.md` 的 OBS URL 改用本副本目录名 `Mania%20Replay%20Master%20(fixed)` 并注明"URL 目录名必须与 static 下文件夹同名"；`mrm-live-monitor.mjs` 的过滤器发送补 `applyFilters:` 前缀（裸 JSON 被 tosu 忽略）；`mrm-live-check.mjs` 按 hook/事件状态 `process.exit(1)`（原来恒 0）；`mrm-test.mjs` 的 `currentTime` 断言改名为兼容分支，避免让读者以为精确时钟是可用的。
 - 未改动：`window.__maniaReplayMaster` 暴露可变的 `state` / `settings` / `canvas` / `sockets` 是有意的调试与离线测试接口，保留。
 - 验证：`node --check` 全通过；`node test/mrm-test.mjs` 115/115；两局 1x 录制回归判定数字未变——session-ln3 live `[2348,1264,271,35,11,14]` / exact `[2346,1317,245,20,5,10]`，session-v1-1 live `[2165,1239,423,85,25,6]` / exact `[1959,1755,194,20,12,3]`。
+
+### 29. 未识别 Mirror（MR）mod，谱面镜像时整张图的列都是反的（0.5.4）
+
+- **现象**：开着 Mirror 游玩时，游戏里音符左右翻转，插件覆盖层仍按原始列绘制：音符画在相反的颜色列上，长条被画到别的轨道，看起来像「整张谱面渲染错乱」；暂停界面尤其明显。
+- **原因**：`applyMods()` 只读取 `scoreV2` 位（`1<<29`）与 `rate`，从未处理 Mirror 位（`1<<30` / `acronyms: MR`）；`buildManiaNotes()` 直接按原始 `x` 计算列号，按键钩子与 `.osr` 的物理列号也都没有翻转。
+- **修复**（`main.js`）：新增 `state.mirror`（`applyMods()` 用位掩码 / MR 缩写检测）；`buildManiaNotes()` 在 Mirror 时把列号翻为 `keys-1-column`，并把它并入 `ensureBeatmap()` 的缓存键（换 mod 时重建谱面与 points）；实时路径在 `applyLiveKey()` 入口翻转物理键列；`updateKeyHints()` 的列提示与「未暴露列」排除法按 Mirror 后的列号记录；精确回放在 `exactOffsetFor()` 与 `applyExactTimeline()` 里翻转 `.osr` 的 action 列号。
+- **验证**：`node test/mrm-test.mjs` 增加 6 条断言（列翻转、实时按键匹配翻转列、回放 action 匹配翻转列、MR 缩写与 `1<<30` 两种检测），全套 121/121 通过。
+
+### 30. osu! 切到后台再切回来，覆盖层一片空白，必须重开一局才会恢复（0.5.4）
+
+- **现象**：游戏内覆盖层（tosu ingame overlay）正在游玩时把 osu! 切到后台，再切回 osu! 继续打，覆盖层不再绘制任何音符，只剩透明背景；必须退出并重新开始一局（歌曲时间重新变化）才恢复。旧版实测录到 71 秒空白的完整窗口。
+- **原因**：失焦时 tosu 的覆盖层 surface 被缩到 `0x0`（日志 `Overlay Output: surface resized id:... width: 0 height: 0`），Chromium 会丢弃这块 canvas 的后备存储，画面变空；同时 osu! 失焦自动暂停，tosu 的 `beatmap.time.live` 冻结（录制里 71 秒一直停在 16,357ms），插件 `frame()` 的重绘去重键 `rev`（含 `t.toFixed(3)`、判定计数、窗口、设置等）完全不变，于是每帧都提前 `return`——**期间一次重绘都没有**，空白的画面自然补不回来。
+- **修复**（`main.js`）：
+  1. `canvas` 监听 `contextlost` / `contextrestored`，恢复时重新取 2D context 并清空重绘去重状态；同时去掉 `desynchronized: true`，降低隐藏页面丢后备存储的概率。
+  2. `resize()` 在 `innerWidth/innerHeight < 2` 时直接返回，不再把 canvas 缩成 `1x1` 并清空；`frame()` 在 canvas 尺寸过小（<8）时也跳过绘制。
+  3. 重绘去重加心跳：同一 `rev` 最多 1 秒必须重绘一次，保证被浏览器丢弃的画面能自愈。
+  4. 新增 `scheduleFrame()` 单帧调度，避免唤醒逻辑反复调用 `frame()` 叠加出多条渲染循环。
+  5. 新增 `wakeUpRendering()`：`resize` / `focus` / `pageshow` / `visibilitychange`（转为可见）时清去重状态、重新 `resize()`、补开被浏览器断开的三个 WebSocket、立即重绘一帧。
+- **验证**：`node test/mrm-test.mjs` 121/121；离线探针（vm 桩加载 `main.js`）在「viewport 塌成 0×0」「失焦 8 秒无 v2」「离开 play 再回 play」三种情况下都保持每帧重绘（43 个 canvas op），修复前 0×0 与长时间断流会停止重绘。
+- **限制**：修复后仍需刷新一次覆盖层页面（tosu 重启游戏内覆盖层或 OBS 浏览器源“刷新缓存”）才能加载到新代码；刷新过一次之后即可自愈。
+
+### 31. 未识别 Random（RD）mod，谱面列被随机打乱时整张图错位（0.5.4）
+
+- **现象**：开着 Random 游玩时，游戏里音符被随机换列，插件仍按谱面原始列绘制，整张图与按键/判定完全对不上（与 Mirror 那次的表现类似，但每局置换不同）。
+- **原因**：`applyMods()` 只处理了 ScoreV2 与 Mirror 位，完全没有 RD（`1<<21` / `RD` 缩写）。RD 的列置换由游戏按本局 RNG 种子生成，种子只写在 `.osr` 的结束帧 `-12345|0|0|<seed>` 里；游玩中也没有任何可读接口。
+- **修复**（`main.js` / `tools/mrm-helper.mjs`）：
+  1. 实现 .NET Framework `System.Random`（56 槽减法发生器）与 stable 的拒绝采样洗牌 `rdShuffledColumns(seed, keys)`（抽列、重复重抽），得到「谱面列 → 显示列」的映射 `displayColumn()` / `sourceColumn()`。
+  2. helper 解析 `.osr` 时读取结束帧种子，`/replay` 响应新增 `seed` 字段。
+  3. 回放路径用种子构建显示列并重建谱面，音符、按键、`.osr` action 全部在「显示空间」对齐（不再二次映射）。
+  4. Live 路径没有 `.osr`，用前 ~48 个按键对 24 种置换打分推断（margin ≥ 6 才锁定），锁定后重建谱面并重判。
+  5. RD 与 Mirror 叠加：先洗牌后翻转。
+- **验证**：同一张 4K 谱面 7 局回放（含 6 局 RD），用种子重建后判定计数与游戏结算的 L1 为 0–18（此前整局错位）；`node test/mrm-test.mjs` 新增 11 条 RD 断言，全套 134/134 通过；两局 1x 录制回归数字不变（ln3 live 2348/1264/271/35/11/14、exact 2346/1317/245/20/5/10；v1-1 live 2165/1239/423/85/25/6、exact 1959/1755/194/20/12/3）。
+- **文档**：新增 `docs/stable-mania-random.md`，面向其他插件/谱面工具说明种子帧格式、.NET Random 拒绝采样算法、方向约定、测试向量与 Live 推断方法。
+
+### 32. 覆盖层状态行诊断文字过多（0.5.4）
+
+- **现象**：状态行长期显示 `dbg 0.5.4-focus5 · selectPlay · 1178x691 · win … · notes 1064 · chart · stale 0 · paint … · ctx ok · skip …` 之类诊断串，遮挡画面且对用户没有意义。
+- **修复**（`main.js`）：`statusText()` 改为只显示 `helper hook: on|off`（由 `state.liveReady && !state.helperHookError` 推出）；长诊断串保留在 `?debug=1` 查询参数下。
+- **验证**：`node test/mrm-test.mjs` 134/134。
+
+### 33. lazer 导出的 `.osr` 里 Random 种子恒为 0，回放无法还原列置换（0.5.4）
+
+- **现象**：用 osu!lazer 导出的 `.osr` 回放 RD 局时，插件按种子 0 生成置换，整张图错列。
+- **原因**：lazer `LegacyScoreEncoder` 的 `replayStringContent` 末尾硬编码 `-12345|0|0|0`（种子没有进入 legacy 格式）；20130319 之前的 stable 回放也没有种子帧。helper 之前把 0 当作真实种子返回。
+- **修复**：helper `seedFromText()` 把 0 视为“未知”（返回 null）；插件在 RD 且无可用种子时改用 `inferColumnPermutation()` 从输入帧反推置换（列计数剪枝 + 时间匹配 + 唯一性门槛）。
+- **验证**：`node test/mrm-test.mjs` 136/136；6 局真实 RD 回放（4K）反推结果与种子置换逐位一致。
+
+### 34. lazer 导出的回放读不到 RD 种子（0.5.4）
+
+文件：`tools/mrm-helper.mjs`、`main.js`、`test/mrm-test.mjs`、`docs/stable-mania-random.md`。
+
+现象：osu!lazer 导出的 `.osr`，结束帧固定为 `-12345|0|0|0`；RD 局只能从按键反推置换，且无法区分 lazer 与 stable 的洗牌算法。
+
+原因：lazer 的 `LegacyScoreEncoder` 把种子硬编码成 0（种子不进入 legacy 帧）。但同一文件在回放流之后还有第二块 LZMA 数据（`LegacyReplaySoloScoreInfo` 的 JSON），其中 `mods[].settings.seed` 带着真实的 RD 种子；此前 helper 只解压第一块，因此看不到。
+
+修复：
+
+- helper 新增 `readScoreInfoBlock()`：跳过回放流与 8 字节 `LegacyOnlineID`，读 int32 长度并解压 JSON，取出 RD 的 `settings.seed`；`/replay` 响应新增 `lazerSeed` / `lazerMods`。
+- `main.js` 新增 `lazerShuffledColumns()`（`OrderBy(_ => rng.Next())` 的稳定排序语义）与 `state.seedKind`；`maybeExact()` 优先使用 lazer 种子并走 lazer 算法，其次 stable 种子（拒绝采样），最后才反推。`columnMapKey()` 带上种子来源，切换来源会重建谱面。
+- `test/mrm-test.mjs` 增加 6 条 lazer 测试向量（与 .NET Framework `OrderBy` 输出逐位一致）与种子来源相关的缓存键断言。
+
+验证：构造带 score-info 块的 `.osr`，helper 返回 `lazerSeed: 30745429`、`lazerMods: ["RD"]`；stable 文件仍返回 `lazerSeed: null`。测试 144/144。
 
 ## 未改动 / 保留的已知设计
 - `classifyError()` 对超出 50 窗口的已记录误差固定归类为 50（测试 `recorded hit never classifies as miss` 固化）：依赖 tosu precise 只上报“已命中的判定”。如未来 tosu 开始上报 miss，需要重新评估。

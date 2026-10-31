@@ -944,6 +944,166 @@ console.log("== playback clock extrapolation ==");
   api.state.timeSpeed = 1;
 }
 
+console.log("== mirror mod ==");
+{
+  api.state.mirror = false;
+  const plain = api.buildManiaNotes(parsed, 4);
+  api.state.mirror = true;
+  const flipped = api.buildManiaNotes(parsed, 4);
+  ok(
+    "mirror flips every column",
+    plain.notes.length === flipped.notes.length && flipped.notes.every((n, i) => n.column === 3 - plain.notes[i].column),
+    [plain.notes.map((n) => n.column).join(","), flipped.notes.map((n) => n.column).join(",")]
+  );
+  api.state.mapMode = "mania";
+  api.state.csConverted = 4;
+  api.state.odConverted = 8.5;
+  api.state.hitWindow = null;
+  api.state.client = "stable";
+  api.state.scoreV2 = false;
+  api.state.beatmap = flipped;
+  api.updateWindows();
+  api.buildPoints();
+  api.resetJudgements();
+  // The chart is drawn mirrored, so the note is displayed in column 3 and physical key 3 hits it.
+  api.applyLiveKey(3, 1000, true);
+  ok("mirror live key matches the flipped column", api.state.noteState[0].head === 0, api.state.noteState[0].head);
+  api.resetJudgements();
+  const mirrorExact = api.applyExactTimeline([{ column: 3, time: 1000, endTime: 1000 }], 0);
+  ok("mirror exact action matches the flipped column", mirrorExact === true && api.state.noteState[0].head === 0, [mirrorExact, api.state.noteState[0].head]);
+  api.state.mirror = false;
+  api.applyMods({ number: 0, rate: 1, array: [{ acronym: "MR" }] });
+  ok("mirror detected from the MR acronym", api.state.mirror === true);
+  api.applyMods({ number: 1 << 30, rate: 1, array: [] });
+  ok("mirror detected from the stable bitmask", api.state.mirror === true);
+  api.applyMods({ number: 0, rate: 1, array: [] });
+  ok("mirror cleared without MR", api.state.mirror === false);
+  api.state.beatmap = map;
+  api.state.scoreV2 = true;
+  api.state.client = "stable";
+  api.state.odConverted = 8.5;
+  api.updateWindows();
+  api.buildPoints();
+  api.resetJudgements();
+}
+
+console.log("== random mod (RD) ==");
+{
+  const vectors = [
+    [0, "2301"],
+    [30745429, "0132"],
+    [30840347, "2301"],
+    [34973272, "1302"],
+  ];
+  for (const [seed, expected] of vectors) {
+    const got = api.rdShuffledColumns(seed, 4).join("");
+    ok(`rd shuffle for seed ${seed}`, got === expected, [got, expected]);
+  }
+
+  // osu!lazer never writes the seed into the legacy frame, but scores exported from lazer
+  // carry it in the appended LegacyReplaySoloScoreInfo block. Its shuffle is
+  // Enumerable.Range(0, n).OrderBy(_ => rng.Next()) - a stable sort by random key.
+  // Expected values below were produced by .NET Framework itself (LINQ OrderBy + Random).
+  const lazerVectors = [
+    [0, "3021"],
+    [1, "1023"],
+    [42, "2130"],
+    [30745429, "3102"],
+    [34973272, "3021"]
+  ];
+  for (const [seed, expected] of lazerVectors) {
+    const got = api.lazerShuffledColumns(seed, 4).join("");
+    ok(`lazer rd shuffle for seed ${seed}`, got === expected, [got, expected]);
+  }
+  ok(
+    "lazer and stable shuffles differ",
+    api.lazerShuffledColumns(30745429, 4).join("") !== api.rdShuffledColumns(30745429, 4).join("")
+  );
+
+  api.state.mirror = false;
+  api.state.random = true;
+  api.state.seed = 30745429;
+  api.rebuildColumnMap(4);
+  ok(
+    "rd maps beatmap columns to displayed columns",
+    [0, 1, 2, 3].map((c) => api.displayColumn(c)).join("") === "0132",
+    [0, 1, 2, 3].map((c) => api.displayColumn(c)).join("")
+  );
+  ok("rd maps a displayed column back to its beatmap column", api.sourceColumn(3) === 2 && api.sourceColumn(1) === 1);
+
+  const rdNotes = api.buildManiaNotes(parsed, 4);
+  ok(
+    "rd chart is drawn in shuffled columns",
+    rdNotes.notes.every((n) => n.column === api.displayColumn(n.raw)),
+    rdNotes.notes.map((n) => n.column).join(",")
+  );
+  const first = rdNotes.notes[0];
+  api.state.beatmap = rdNotes;
+  api.state.mapMode = "mania";
+  api.state.csConverted = 4;
+  api.state.odConverted = 8.5;
+  api.state.hitWindow = null;
+  api.state.client = "stable";
+  api.state.scoreV2 = false;
+  api.updateWindows();
+  api.buildPoints();
+  api.resetJudgements();
+  api.applyLiveKey(first.column, first.time, true);
+  ok("rd live key matches the shuffled column", api.state.noteState[0].head === 0, api.state.noteState[0].head);
+  api.resetJudgements();
+  const rdExact = api.applyExactTimeline([{ column: first.column, time: first.time, endTime: first.time }], 0);
+  ok(
+    "rd exact action matches the shuffled column",
+    rdExact === true && api.state.noteState[0].head === 0,
+    [rdExact, api.state.noteState[0].head]
+  );
+  api.state.seedKind = "stable";
+  ok("rd beatmap identity includes the seed", api.columnMapKey() === "rdstable30745429", api.columnMapKey());
+  api.state.seedKind = "lazer";
+  ok("rd beatmap identity includes the seed source", api.columnMapKey() === "rdlazer30745429", api.columnMapKey());
+  api.state.seedKind = null;
+  api.state.random = false;
+  api.state.seed = null;
+  api.state.mirror = false;
+  api.rebuildColumnMap(4);
+  ok("plain beatmap identity after clearing mods", api.columnMapKey() === "plain", api.columnMapKey());
+  api.state.random = true;
+  api.state.seed = 30745429;
+  api.rebuildColumnMap(4);
+
+  api.state.random = false;
+  api.state.seed = null;
+  api.rebuildColumnMap(4);
+  api.applyMods({ number: 1 << 21, rate: 1, array: [] });
+  ok("rd detected from the stable bitmask", api.state.random === true);
+  api.applyMods({ number: 0, rate: 1, array: [{ acronym: "RD" }] });
+  ok("rd detected from the RD acronym", api.state.random === true);
+  api.applyMods({ number: 0, rate: 1, array: [] });
+  ok("rd cleared without RD", api.state.random === false);
+  api.state.beatmap = map;
+  api.state.scoreV2 = true;
+  api.state.client = "stable";
+  api.state.odConverted = 8.5;
+  api.updateWindows();
+  api.buildPoints();
+  api.resetJudgements();
+}
+
+console.log("== RD column inference (no seed in .osr) ==");
+
+// osu!lazer's legacy exporter writes `-12345|0|0|0`, so replay seeds have to be
+// reconstructed from the recorded presses.
+const inferNotes = [];
+for (let c = 0; c < 4; c++) for (let i = 0; i < 10; i++) inferNotes.push({ time: 1000 + i * 200 + c * 37, column: c, raw: c, endTime: 0 });
+const inferPerm = [2, 0, 3, 1];
+const inferInverse = new Array(4);
+for (let d = 0; d < 4; d++) inferInverse[inferPerm[d]] = d;
+const inferActions = inferNotes.map((n) => ({ column: inferInverse[n.column], time: n.time + 25, endTime: 0 }));
+const inferredPerm = api.inferColumnPermutation(inferNotes, inferActions, 4);
+ok("inferColumnPermutation recovers a shuffle", Array.isArray(inferredPerm) && inferredPerm.join("") === "2031", inferredPerm && inferredPerm.join(""));
+const scrambledPerm = api.inferColumnPermutation(inferNotes, inferActions.map((a, i) => ({ column: (a.column + 1) % 4, time: a.time + i * 53, endTime: 0 })), 4);
+ok("inference rejects ambiguous input", scrambledPerm === null, scrambledPerm && scrambledPerm.join(""));
+
 console.log("== rendering ==");
 api.state.gameState = "play";
 api.state.mapMode = "mania";

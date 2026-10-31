@@ -1,4 +1,19 @@
-# Mania Replay Master v0.5.4 修复说明（未发布）
+# Mania Replay Master v0.5.5 更新说明
+
+**小版本更新**：新增 Mirror / Random mod 支持、修复覆盖层切后台（含 QQ 截图）后一片空白、精简状态行，并清理了开发期脚本与内部审查文档。
+
+- **Mirror（MR）支持**：识别 `1<<30` 与 `MR` 缩写后，翻转音符列、按键列、键位提示与 `.osr` action 列；谱面镜像时不再整张画反（此前整排音符被判成 miss）。
+- **Random（RD）兼容无种子的 `.osr`**：osu!lazer 导出的 `.osr` 结束帧固定写 `-12345|0|0|0`（种子不进入 legacy 格式），旧版回放也没有该帧；插件此时改用输入帧反推列置换（列计数剪枝 + 时间匹配 + 唯一性门槛），6 局真实 RD 回放逐位一致。
+- **Random（RD）支持**：Replay 从 `.osr` 结束帧 `-12345|0|0|<seed>` 读出本局种子，用 .NET `System.Random` 的拒绝采样重建列置换，7 局实测判定计数与结算的 L1 偏差 0–18；Live 无 `.osr` 时用前 ~48 次按键推断置换（约 8–10 秒锁定）。算法与验证向量见 [docs/stable-mania-random.md](docs/stable-mania-random.md)，其他插件/谱面工具可直接复用。
+- **覆盖层空白自愈**：osu! 切后台或用 QQ 截图（Ctrl+Alt+A）后，覆盖层 surface 会丢失、canvas 后备存储被丢弃；现在加入 1 秒心跳重绘、`contextlost` / `contextrestored` 处理、`focus` / `pageshow` / `visibilitychange` 唤醒、canvas 探针与重建，切回后无需重开一局。
+- **状态行精简**：覆盖层只保留 `helper hook: on|off`，长诊断串改到 `?debug=1` 下显示。
+- **helper**：`/replay` 响应新增 `seed` / `lazerSeed` / `lazerMods` 字段（供 Random 使用）。
+- **lazer 的 RD 种子**：lazer 导出的 `.osr` 结束帧恒为 0，但文件末尾追加的 `LegacyReplaySoloScoreInfo` 块里带着 `mods[].settings.seed`；helper 现在会读出它，插件按 lazer 的 `OrderBy(rng.Next())` 洗牌重建置换（与 stable 的拒绝采样不同），再没有才回落到按键反推。
+- **清理**：移除开发期的录制/分析脚本与内部审查报告，仓库只保留插件运行代码与单元测试。
+
+测试：`node test/mrm-test.mjs` 144/144（含 Mirror / Random / lazer 种子）。
+
+# Mania Replay Master v0.5.4 修复说明
 
 本次重写「回放模式」（读取 `.osr` 的精确管线）的判定模型：此前回放渲染出来的判定颜色与 osu! 实际结算相差很大，长条尤其明显（整根变紫/红、头尾互换、密集 LN 段落整排串色）。
 
@@ -15,6 +30,10 @@
 - **误差校正改为联合配对**：`hitErrors` 不再按「误差值最接近」硬配（密集 LN 处误差值大量重复会错位），改为按「隐含按键时间 + 误差值」打分配对，避免整排判定档位翻转。
 - **V1 长条合并规则对齐客户端**：`|头误差| + |尾误差| <= 窗口*rate*2`（rate 1.2/1.1），尾判早放超过 miss 窗口判 miss。
 - **miss 宽限 30ms**：等迟到的 `hitErrors` / 按键事件，避免先判 miss 再丢误差。
+- **切后台不再变空白**：失焦暂停时 tosu 的 surface 会缩成 `0x0` 并丢掉 canvas 内容，而歌曲时间冻结让重绘去重一直命中；现在同一帧最多 1 秒强制重绘一次，并监听 `contextlost`/`contextrestored`、`focus`/`pageshow`/`visibilitychange` 立即唤醒渲染、补开断开的 WebSocket。
+- **支持 Mirror（MR）mod**：识别 Mirror 位 / `MR` 缩写后翻转音符列、按键列与 `.osr` action 列，谱面镜像时不再画出「整张反了」的图。
+- **支持 Random（RD）mod**：从 `.osr` 结束帧 `-12345|0|0|<seed>` 读出本局种子，用 .NET `System.Random` 的拒绝采样重建列置换（回放即时生效）；游玩中无 `.osr` 时用前 ~48 个按键推断置换（约 8–10 秒锁定）。实测 6 局 RD 回放的判定计数与结算 L1 为 0–18。新增 `docs/stable-mania-random.md` 供其他插件/谱面工具参考。
+- **状态行精简**：覆盖层只保留 `helper hook: on|off`，长诊断串改到 `?debug=1` 下显示。
 
 - **ScoreV2 整屏回退修复**：ScoreV2 每打一个判定都会重算总分，长条提前松手被改判 miss 时 `play.score` 会小幅回落，旧的「重开检测」把它当成重打并 `resetJudgements()`，导致已经上色的音符（含附近无关 LN）整片退回未判定色。现改为只看判定计数是否清零（实测一局 164s 内 31 次误触 → 0 次）。
 - **ScoreV2 长条尾判修正**：客户端对 ScoreV2 长条的释放判定先把释放误差除以 1.5 再查窗口，头判未命中时整条最多 MEH；此前直接用原始误差查窗口，导致密集 LN 尾巴整体偏严。修正后同一局实时计数与结算的 L1 偏差 620 → 106，尾判类别不同的 note 656 → 182。
@@ -41,7 +60,7 @@
 
 实测（同一份 V1 录制回放对比游戏结算）：实时 note 级分布偏差 L1 448 → 68，头判类不同的 note 1195 → 264、尾判 884 → 194，`|dE| <= 5ms` 5.7% → 80.3%，着色延迟 p95 171.4 → 111.2ms。
 
-测试：`node test/mrm-test.mjs` 112/112 通过；`node test/ln-analyze.mjs --session ln-logs/session-v1-1` 与 `--session ln-logs/session-ln3` 复现上述数字。
+测试：`node test/mrm-test.mjs` 112/112 通过；`test/ln-analyze.mjs`（开发期脚本，已移除） 与 `--session ln-logs/session-ln3` 复现上述数字。
 
 ---
 
