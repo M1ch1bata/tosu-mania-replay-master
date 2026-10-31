@@ -22,6 +22,8 @@ function argValue(name, fallback) {
 const port = Number(argValue("port", 24051));
 const osuDirOverride = String(argValue("osu", "") || "").trim();
 const token = String(argValue("token", "") || "");
+// --token: when set, every request must supply ?token=... (or the X-MRM-Token header).
+// --tosu-port / SERVER_PORT: only this tosu page origin may call the helper (default 24050).
 const exitIdleSec = Math.max(0, Number(argValue("exit-idle", 0)) || 0);
 const watchProcesses = String(argValue("watch-process", "") || "")
   .split(",")
@@ -108,20 +110,49 @@ function currentReplayDir() {
 }
 
 const ORIGIN_RE = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
+// Only the tosu page itself may talk to the helper. Previously a request without an Origin
+// header was accepted, so any local web page (or any local process) could start the global
+// key hook and read every key the user types. The referer fallback keeps fetch/EventSource
+// working when a browser omits Origin.
+const tosuPort = Number(argValue("tosu-port", process.env.SERVER_PORT || 24050)) || 24050;
+const ALLOWED_ORIGINS = new Set([
+  `http://127.0.0.1:${tosuPort}`,
+  `http://localhost:${tosuPort}`,
+  `http://[::1]:${tosuPort}`
+]);
+
+function originFor(req) {
+  const origin = String(req.headers.origin || "").trim();
+  if (origin) return ALLOWED_ORIGINS.has(origin) ? origin : null;
+  const referer = String(req.headers.referer || "").trim();
+  if (referer) {
+    const m = /^(https?:\/\/[^/]+)\//i.exec(referer);
+    if (m && ALLOWED_ORIGINS.has(m[1])) return m[1];
+  }
+  return "";
+}
 
 function corsFor(req) {
-  const origin = String(req.headers.origin || "");
-  if (origin && !ORIGIN_RE.test(origin)) return null;
+  const origin = originFor(req);
+  if (origin === null) return null;
   return {
-    "Access-Control-Allow-Origin": origin || "*",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Origin": origin || "null",
+    "Access-Control-Allow-Headers": "Content-Type, X-MRM-Token",
     Vary: "Origin"
   };
 }
 
-function tokenOk(url) {
-  if (!token) return true;
-  return url.searchParams.get("token") === token;
+function tokenOk(url, req) {
+  const supplied = String(url.searchParams.get("token") || req.headers["x-mrm-token"] || "");
+  if (!token) {
+    // Without a token the tosu origin is the only accepted caller. A request without a
+    // verifiable Origin (curl, a stray local process) is rejected instead of waved through.
+    return originFor(req) !== "";
+  }
+  if (supplied.length !== token.length) return false;
+  let diff = 0;
+  for (let i = 0; i < token.length; i++) diff |= supplied.charCodeAt(i) ^ token.charCodeAt(i);
+  return diff === 0;
 }
 
 // ---------- osr parsing ----------
@@ -181,7 +212,11 @@ function parseOsr(filePath) {
   const replayLen = buf.readInt32LE(o);
   o += 4;
   const blob = new Uint8Array(buf.buffer, buf.byteOffset + o, replayLen);
+  if (!blob.length) return null;
+  // A corrupted or truncated stream can decompress into an enormous string; refuse it
+  // instead of exhausting the heap, and let /replay answer found:false.
   const text = String(LZMA.decompress(blob));
+  if (!text || text.length > MAX_REPLAY_TEXT) return null;
   return { md5: md5.value, player: player.value, counts, score, mods, text };
 }
 
@@ -218,6 +253,7 @@ function extractActions(text, keys, pressOffset = 0) {
 }
 
 const osrCache = new Map();
+const MAX_REPLAY_TEXT = 8 * 1024 * 1024;
 
 function listReplays() {
   const dir = currentReplayDir();
@@ -231,6 +267,31 @@ function listReplays() {
   return names;
 }
 
+// Read only the header of a .osr: mode, version, player, beatmap md5.
+function readHeaderMd5(filePath) {
+  let fd = -1;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(1024);
+    const got = fs.readSync(fd, buf, 0, buf.length, 0);
+    if (got < 32) return "";
+    const head = buf.subarray(0, got);
+    // .osr header order: mode, version, beatmap md5, player name, replay md5.
+    const md5 = readString(head, 5);
+    return /^[0-9a-f]{32}$/i.test(md5.value) ? md5.value.toLowerCase() : "";
+  } catch {
+    return "";
+  } finally {
+    if (fd >= 0) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 function findReplayFile(md5) {
   const target = String(md5 || "").toLowerCase();
   if (!/^[0-9a-f]{32}$/.test(target)) return "";
@@ -238,24 +299,35 @@ function findReplayFile(md5) {
   if (!dir) return "";
   let best = "";
   let bestMtime = -1;
+  const others = [];
   for (const name of listReplays()) {
-    if (!name.toLowerCase().startsWith(target)) continue;
     const full = path.join(dir, name);
+    let mtime = -1;
     try {
-      const mtime = fs.statSync(full).mtimeMs;
+      mtime = fs.statSync(full).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (name.toLowerCase().startsWith(target)) {
       if (mtime > bestMtime) {
         bestMtime = mtime;
         best = full;
       }
-    } catch {
+      continue;
     }
+    // osu!lazer writes replays as <score-id>.osr, so the md5 is only in the header.
+    others.push({ full, mtime });
   }
-  return best;
+  if (best) return best;
+  others.sort((a, b) => b.mtime - a.mtime);
+  const limit = Math.min(others.length, 600);
+  for (let i = 0; i < limit; i++) {
+    if (readHeaderMd5(others[i].full) === target) return others[i].full;
+  }
+  return "";
 }
 
-function loadReplay(md5) {
-  const file = findReplayFile(md5);
-  if (!file) return null;
+function readReplayFile(file) {
   let mtime = 0;
   try {
     mtime = fs.statSync(file).mtimeMs;
@@ -264,6 +336,7 @@ function loadReplay(md5) {
   const cached = osrCache.get(file);
   if (cached && cached.mtime === mtime) return cached.data;
   const osr = parseOsr(file);
+  if (!osr) return null;
   const data = {
     file: path.basename(file),
     md5: osr.md5,
@@ -275,8 +348,35 @@ function loadReplay(md5) {
     scoreV2: (osr.mods & (1 << 29)) !== 0,
     text: osr.text
   };
+  while (osrCache.size > 24) {
+    const oldest = osrCache.keys().next().value;
+    if (oldest === undefined) break;
+    osrCache.delete(oldest);
+  }
   osrCache.set(file, { mtime, data });
   return data;
+}
+
+function loadReplay(md5) {
+  const file = findReplayFile(md5);
+  if (!file) return null;
+  return readReplayFile(file);
+}
+
+// Pick a concrete replay file by basename. Needed when several .osr files share the same beatmap
+// md5 (e.g. after playing the map more than once): findReplayFile() returns the newest one, which
+// may be a different attempt than the caller wants to analyse.
+function loadReplayByFile(md5, name) {
+  const dir = currentReplayDir();
+  if (!dir) return null;
+  const raw = String(name || "").trim();
+  const base = path.basename(raw);
+  if (base !== raw || base.length <= 32 || !base.toLowerCase().endsWith(".osr")) return null;
+  const target = String(md5 || "").toLowerCase();
+  if (target && !base.toLowerCase().startsWith(target)) return null;
+  const full = path.join(dir, base);
+  if (!fs.existsSync(full)) return null;
+  return readReplayFile(full);
 }
 
 // ---------- live key hook ----------
@@ -312,8 +412,11 @@ const STABLE_LAYOUTS = {
 };
 
 let cfgFiles = null;
+let cfgFilesAt = 0;
 function cfgCandidates() {
-  if (cfgFiles && cfgFiles.length) return cfgFiles;
+  // osu! rewrites its .cfg (key layout) whenever settings change; a cached listing would
+  // keep serving a stale layout, so re-scan after 30s instead of caching forever.
+  if (cfgFiles && cfgFiles.length && Date.now() - cfgFilesAt < 30000) return cfgFiles;
   const dir = currentOsuDir();
   if (!dir) return [];
   let names = [];
@@ -324,6 +427,7 @@ function cfgCandidates() {
   }
   names.sort((a, b) => (a.toLowerCase() === "osu!.cfg" ? 1 : b.toLowerCase() === "osu!.cfg" ? -1 : a.localeCompare(b)));
   cfgFiles = names.map((n) => path.join(dir, n));
+  cfgFilesAt = Date.now();
   return cfgFiles;
 }
 
@@ -452,7 +556,13 @@ function ensureHook(keys) {
   const proc = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-Map", spec], {
     windowsHide: true
   });
-  const state = { proc, spec, buffer: "" };
+  const state = { proc, spec, buffer: "", keys };
+  proc.on("error", (err) => {
+    const message = String((err && err.message) || err);
+    console.error("[mrm-helper] hook spawn failed: " + message);
+    if (hookProc === state) hookProc = null;
+    broadcast({ type: "error", message: "hook spawn failed: " + message });
+  });
   proc.stdout.on("data", (chunk) => {
     state.buffer += chunk.toString("utf8");
     let idx;
@@ -479,11 +589,16 @@ function ensureHook(keys) {
 }
 
 function broadcast(event) {
-  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  const payload = "data: " + JSON.stringify(event) + "\n\n";
   for (const res of sseClients) {
+    if (res.writableEnded) {
+      sseClients.delete(res);
+      continue;
+    }
     try {
       res.write(payload);
     } catch {
+      sseClients.delete(res);
     }
   }
 }
@@ -498,7 +613,7 @@ const server = http.createServer((req, res) => {
     res.end("forbidden origin");
     return;
   }
-  if (!tokenOk(u)) {
+  if (!tokenOk(u, req)) {
     res.writeHead(403, { ...cors, "Content-Type": "text/plain" });
     res.end("forbidden token");
     return;
@@ -515,17 +630,19 @@ const server = http.createServer((req, res) => {
   }
   if (u.pathname === "/replay") {
     const md5 = u.searchParams.get("md5") || "";
+    const fileName = String(u.searchParams.get("file") || "").trim();
     let data = null;
     try {
-      data = loadReplay(md5);
+      data = fileName ? loadReplayByFile(md5, fileName) : loadReplay(md5);
     } catch (err) {
+      console.error("[mrm-helper] /replay failed:", (err && err.stack) || err);
       res.writeHead(500, { ...cors, "Content-Type": "application/json" });
-      res.end(JSON.stringify({ found: false, error: String(err && err.message) }));
+      res.end(JSON.stringify({ found: false, error: "internal error" }));
       return;
     }
     if (!data) {
       res.writeHead(200, { ...cors, "Content-Type": "application/json" });
-      res.end(JSON.stringify({ found: false, md5 }));
+      res.end(JSON.stringify({ found: false, md5, file: fileName || undefined }));
       return;
     }
     const keys = Math.max(1, Math.min(18, parseInt(u.searchParams.get("keys") || "4", 10) || 4));
@@ -547,7 +664,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (u.pathname === "/live") {
-    const keys = parseInt(u.searchParams.get("keys") || "4", 10) || 4;
+    const keys = Math.max(1, Math.min(18, parseInt(u.searchParams.get("keys") || "4", 10) || 4));
     const info = ensureHook(keys);
     res.writeHead(200, {
       ...cors,
@@ -555,14 +672,26 @@ const server = http.createServer((req, res) => {
       "Cache-Control": "no-store",
       Connection: "keep-alive"
     });
-    res.write(`data: ${JSON.stringify({ type: "hello", keys, hook: info.ok, error: info.error || "", layout: info.layout || "", from: info.from || "" })}\n\n`);
+    res.write("data: " + JSON.stringify({ type: "hello", keys, hook: info.ok, hookKeys: hookProc ? hookProc.keys : 0, error: info.error || "", layout: info.layout || "", from: info.from || "" }) + "\n\n");
     sseClients.add(res);
     cancelHookIdle();
-    req.on("close", () => {
+    const ping = setInterval(() => {
+      try {
+        res.write(": ping\n\n");
+      } catch {
+        clearInterval(ping);
+        sseClients.delete(res);
+      }
+    }, 10000);
+    if (typeof ping.unref === "function") ping.unref();
+    const cleanup = () => {
+      clearInterval(ping);
       sseClients.delete(res);
       if (sseClients.size === 0) scheduleHookIdle();
       markActivity();
-    });
+    };
+    req.on("close", cleanup);
+    res.on("error", cleanup);
     return;
   }
   res.writeHead(404, cors);
@@ -577,6 +706,11 @@ server.listen(port, "127.0.0.1", () => {
   if (watchProcesses.length) console.log(`[mrm-helper] will exit when these processes are gone: ${watchProcesses.join(", ")}`);
   startProcessWatch();
   markActivity();
+});
+
+server.on("error", (err) => {
+  console.error("[mrm-helper] server error: " + String((err && err.message) || err));
+  process.exit(1);
 });
 
 function shutdown() {

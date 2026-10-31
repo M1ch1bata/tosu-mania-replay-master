@@ -423,7 +423,7 @@ console.log("== precise clock & hook timing ==");
 api.state.liveActive = true;
 sb.__advance(50);
 api.onPrecise({ currentTime: 12345, hitErrors: [] });
-ok("precise currentTime drives the live clock", Math.abs(api.renderTime() - 12345) < 20, api.renderTime());
+ok("precise currentTime compat branch drives the live clock", Math.abs(api.renderTime() - 12345) < 20, api.renderTime());
 api.state.liveActive = false;
 api.state.liveAnchorHook = null;
 api.state.modsRate = 1;
@@ -439,7 +439,13 @@ api.state.modsRate = 1;
 const stallBase = api.hookSongTime(2000);
 sb.__advance(2000);
 const stallResync = api.hookSongTime(2001);
-ok("hook clock resyncs to game clock after a stall", Math.abs(stallResync - api.renderTime()) < 5, [stallBase, stallResync, api.renderTime()]);
+// After a 2s jump the hook anchor is dropped and the game clock is used directly, so the
+// two must agree exactly (previously this compared two frozen samples with a 5ms slack).
+// After a 2s jump the hook anchor is dropped and the game clock is used directly (only the
+// accumulated live bias is subtracted), so the mapping must be exact, not just close.
+// The 2s gap is larger than the anchor window, so the anchor is refreshed from the frozen
+// game clock: the mapped song time may only advance by the 1ms hook delta, not by 2s.
+ok("hook clock does not jump after a stall", Math.abs(stallResync - (stallBase + 1)) < 1e-6 && Math.abs(stallResync - api.renderTime()) < 5, [stallBase, stallResync, api.renderTime()]);
 
 console.log("== live game-error correction ==");
 hintSetup(["64,192,1000,1,0,0:0:0:0:"], 4);
@@ -825,6 +831,118 @@ api.state.hits = null;
 console.log("== reset ==");
 api.resetJudgements();
 ok("errors reset", api.state.errorCount === 0 && api.state.noteState.every((s) => s.head === null && s.tail === null));
+
+console.log("== exact judgement model (0.5.4 regression) ==");
+{
+  const w = [16, 40, 73, 103, 127, 164];
+  const note = (time, column, endTime) => ({ time, column, endTime: endTime === undefined ? time : endTime, hold: endTime !== undefined && endTime > time });
+  const act = (column, time, endTime) => ({ column, time, endTime: endTime === undefined ? time : endTime, index: 0, related: -1 });
+  const run = (notes, actions, sv2) => {
+    const acts = actions.map((a, i) => ({ ...a, index: i, related: -1 }));
+    const res = api.judgeReplayNotes(notes, acts, w, sv2, true);
+    return { res, counts: api.replayJudgementCounts(notes, res, sv2) };
+  };
+  ok("exact class boundaries", [0, 16, 17, 40, 41, 103, 104, 127, 128].map((d) => api.getJudgementClass(d, w)).join() === "0,0,1,1,2,3,4,4,-1", [0, 16, 17, 40, 41, 103, 104, 127, 128].map((d) => api.getJudgementClass(d, w)));
+
+  {
+    const odBefore = api.state.od;
+    const odcBefore = api.state.odConverted;
+    const rateBefore = api.state.modsRate;
+    const modsBefore = api.state.modsNumber;
+    api.state.od = 8;
+    api.state.odConverted = 0;
+    api.state.modsRate = 1;
+    api.state.modsNumber = 0;
+    const wV1 = api.replayWindowTable(false);
+    const wV2 = api.replayWindowTable(true);
+    api.state.modsNumber = 256; // HT
+    api.state.modsRate = 0.75;
+    const htV1 = api.replayWindowTable(false);
+    const htV2 = api.replayWindowTable(true);
+    ok("exact v1 replay window table (OD8)", wV1.join() === "16,40,73,103,127,164", wV1);
+    ok("ht scales v1 replay windows by rate", htV1.every((v, i) => Math.abs(v - wV1[i] * 0.75) < 1e-9), htV1);
+    ok("ht scales v2 replay windows by rate", htV2.every((v, i) => Math.abs(v - wV2[i] * 0.75) < 1e-9), htV2);
+    api.state.od = odBefore;
+    api.state.odConverted = odcBefore;
+    api.state.modsRate = rateBefore;
+    api.state.modsNumber = modsBefore;
+  }
+
+  let r = run([note(1000, 0)], [act(0, 1005)], false);
+  ok("exact tap perfect", r.res[0].start === 0 && r.res[0].startErr === 5, r.res[0].start);
+  r = run([note(1000, 0)], [act(0, 1500)], false);
+  ok("exact tap outside miss window is a miss", r.res[0].start === -1 && r.counts[5] === 1, r.counts);
+  r = run([note(1000, 0)], [act(0, 700)], false);
+  ok("exact tap too early is not consumed", r.res[0].start === -1 && r.counts[5] === 1, r.counts);
+
+  r = run([note(1000, 0)], [act(0, 1000), act(0, 1110)], false);
+  ok("exact first action claims the note", r.res.length === 1 && r.res[0].start === 0, r.res[0].start);
+  r = run([note(1000, 0)], [act(0, 1060)], false);
+  ok("exact tap class follows window", r.res[0].start === 2, r.res[0].start);
+
+  const hold = [note(1000, 0, 3000)];
+  r = run(hold, [act(0, 1005, 3005)], false);
+  ok("exact v1 hold merges into one judgement", r.res[0].start === 0 && r.res[0].end === 0 && r.counts.join() === "1,0,0,0,0,0", r.counts);
+  r = run(hold, [act(0, 1005, 3005)], true);
+  ok("exact v2 hold keeps head and tail", r.res[0].start === 0 && r.res[0].end === 0 && r.counts.join() === "2,0,0,0,0,0", r.counts);
+  r = run(hold, [act(0, 1005, 2700)], false);
+  ok("exact v1 hold released far early is a miss", r.res[0].start === -1 && r.counts[5] === 1, r.counts);
+  r = run(hold, [act(0, 1005, 3300)], true);
+  ok("exact v2 late release loses only the tail", r.res[0].start === 0 && r.res[0].end === -1 && r.counts.join() === "1,0,0,0,0,1", r.counts);
+  r = run([note(1000, 0), note(1000, 1)], [act(0, 1005)], false);
+  ok("exact chord note without action is a miss", r.counts.join() === "1,0,0,0,0,1", r.counts);
+  r = run([note(1000, 0), note(1000, 1)], [act(0, 1005), act(1, 1000)], false);
+  ok("exact chord columns judged independently", r.counts.join() === "2,0,0,0,0,0", r.counts);
+
+  api.state.beatmap = holdMap;
+  api.state.csConverted = 4;
+  api.state.mapMode = "mania";
+  api.state.hitWindow = null;
+  api.state.odConverted = 8;
+  api.state.scoreV2 = false;
+  api.updateWindows();
+  api.buildPoints();
+  api.state.exactCounts = [0, 0, 0, 2, 0, 0];
+  const actions = [act(0, 1000, 1500), act(2, 2000)];
+  const offset = api.exactOffsetFor(actions);
+  ok("exact offset search returns finite offset", Number.isFinite(offset), offset);
+  api.state.exactCounts = null;
+  ok("exact timeline applies and counts", api.applyExactTimeline(actions, offset) === true && api.state.exactApplied === true && api.panelStats(5000).counts.join() === "2,0,0,0,0,0", api.panelStats(5000).counts);
+  ok("exact timeline marks hold head and tail", api.state.noteState[0].head === 0 && api.state.noteState[0].tail === 0, [api.state.noteState[0].head, api.state.noteState[0].tail]);
+  api.state.exactApplied = false;
+  api.state.exactCounts = null;
+  api.state.cached = false;
+  api.settings.analysisMode = "Auto";
+  api.state.scoreV2 = false;
+  api.state.beatmap = map;
+  api.state.csConverted = 4;
+  api.state.odConverted = 8.5;
+  api.state.hitWindow = null;
+  api.state.hits = null;
+  api.buildPoints();
+  api.updateWindows();
+  api.buildPoints();
+}
+
+console.log("== playback clock extrapolation ==");
+{
+  sb.__advance(500);
+  api.setTime(0);
+  ok("clock starts at speed 1", api.state.timeSpeed === 1, api.state.timeSpeed);
+  for (let i = 1; i <= 8; i++) {
+    sb.__advance(100);
+    api.setTime(i * 150);
+  }
+  ok("DT playback raises timeSpeed above 1.25", api.state.timeSpeed > 1.25, +api.state.timeSpeed.toFixed(3));
+  sb.__advance(50);
+  const extrapolated = api.renderTime();
+  ok("renderTime extrapolates song time", extrapolated > api.state.time, +extrapolated.toFixed(1));
+  sb.__advance(400);
+  ok("stale v2 sample freezes the clock", api.renderTime() === api.state.time, api.renderTime());
+  ok("timeSpeed kept the DT estimate", api.state.timeSpeed > 1.25, +api.state.timeSpeed.toFixed(3));
+  api.setTime(0);
+  api.state.timeSpeed = 1;
+}
 
 console.log("== rendering ==");
 api.state.gameState = "play";

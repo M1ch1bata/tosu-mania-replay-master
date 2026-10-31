@@ -1,3 +1,50 @@
+# Mania Replay Master v0.5.4 修复说明（未发布）
+
+本次重写「回放模式」（读取 `.osr` 的精确管线）的判定模型：此前回放渲染出来的判定颜色与 osu! 实际结算相差很大，长条尤其明显（整根变紫/红、头尾互换、密集 LN 段落整排串色）。
+
+- **判定模型改为与客户端一致**：按参考实现 Mania-Replay-Master 的算法重写（按列先进先出扫描、`TOO_EARLY` / `TOO_LATE` 规则、长条的「同列下一个 note 覆盖」与「hold 过长」检查）。V1 长条改为**头尾合并**判定（`totalDiff <= 窗口*rate*2`），ScoreV2 头尾分开并补上「头判未命中/已 miss 时尾判降为 MEH」的降级规则。
+- **判定窗口改为截断整数**：V1 `[16,34,67,97,121,158] + 3*(10-OD)`（乘 HR/EZ 系数），ScoreV2 用 lazer 的 `DifficultyRange(22.4,19.4,13.9)` 等六段；游戏实际用的是截断值，此前的 `+0.5` 会让边界附近的音符落到相邻判定档。
+- **偏移自动定标**：先用 `fitExactOffset()` 粗估，再用 `.osr` 头部的结算计数在 ±80ms 内逐毫秒搜索，自动消除 `.osr` 与谱面时钟之间约 2.6 秒的整体偏移（实测稳定收敛到 -2629ms）。
+- **回放文件选择**：helper 的 `/replay` 新增可选 `file=` 参数；同一张图有多局 `.osr` 时按录制结束时间选择正确的那一局，不再被「最新文件」带偏。
+
+实测（同一张 4K LN 图，OD8，对比 osu! 结算计数）：V1 模式偏差 L1 由 890 降到 10，ScoreV2 模式由 618 降到 18。
+
+**同一版的实时（Live）判定修复** —— 解决 V1 模式游玩时大范围错色：
+
+- **长条尾判不再抢跑**：实时匹配改为按列先进先出 + 完整窗口检查，松手只判「头已经按下」的长条；此前 871 次松手被提前 1–164ms 判给尚未开始的尾点。V1 长条的头/尾也接入游戏 `hitErrors` 校正，不再只靠钩子时间推算。
+- **误差校正改为联合配对**：`hitErrors` 不再按「误差值最接近」硬配（密集 LN 处误差值大量重复会错位），改为按「隐含按键时间 + 误差值」打分配对，避免整排判定档位翻转。
+- **V1 长条合并规则对齐客户端**：`|头误差| + |尾误差| <= 窗口*rate*2`（rate 1.2/1.1），尾判早放超过 miss 窗口判 miss。
+- **miss 宽限 30ms**：等迟到的 `hitErrors` / 按键事件，避免先判 miss 再丢误差。
+
+- **ScoreV2 整屏回退修复**：ScoreV2 每打一个判定都会重算总分，长条提前松手被改判 miss 时 `play.score` 会小幅回落，旧的「重开检测」把它当成重打并 `resetJudgements()`，导致已经上色的音符（含附近无关 LN）整片退回未判定色。现改为只看判定计数是否清零（实测一局 164s 内 31 次误触 → 0 次）。
+- **ScoreV2 长条尾判修正**：客户端对 ScoreV2 长条的释放判定先把释放误差除以 1.5 再查窗口，头判未命中时整条最多 MEH；此前直接用原始误差查窗口，导致密集 LN 尾巴整体偏严。修正后同一局实时计数与结算的 L1 偏差 620 → 106，尾判类别不同的 note 656 → 182。
+
+- **回放判决的失效检测不再被短路**：exact 判决写入后不再挡住重开 / 时间回退检测，快速重开会丢弃上一局的 .osr 判决；游玩中切换判定来源也会清掉上一模式留下的状态（此前切到 Live 后既不吃钩子按键也不吃 hitErrors）。
+- **可见区间游标随 reviewTime / 滚动速度失效**：调整判定线后已过线的音符曾成片不画（实测 60 帧缺画 520 帧次），现在重建滚动映射时同步重置游标。
+- **旧缓存不再复用**：exact 判定模型重写后 RUN_VERSION 升到 5，老谱重看不会再显示旧算法缓存的错误匹配；run 缓存超限时按时间戳保留最新 30 局。
+- **偏移定标提速**：exactOffsetFor 由 438ms 降到 83ms（两阶段扫描 + fitExactOffset 采样），长图开局不再冻结半秒。
+- **helper 加固**：LZMA 解压上限 8MB、osrCache 上限 24 条、SSE 心跳与死连接清理、/live 的 keys clamp 到 1..18、spawn / EADDRINUSE 有明确错误、无 Origin 请求不再放行。
+- **exact 判定模型补结果级测试**：窗口边界、V1 长条合并、V2 头尾拆分、晚放只丢尾、`exactOffsetFor` 定标与 `applyExactTimeline` 端到端计数都已断言覆盖（单测 92 → 112）。
+- **端到端回放测试不再静默通过**：缺 `MRM_MAP_INDEX` 时打印 SKIP 并以退出码 2 结束，helper 会被杀掉，不再留下钩子进程。
+- **离线分析器时钟修正**：`onV2()` 已经设置过歌曲时间，分析器不再用同一时刻重复 `setTime()`（此前 `dt == 0` 使 `timeSpeed` 恒为 1，DT 分支永远无法覆盖）。
+
+- **连接层与流中断**：ws 按页面协议选 `wss`、重连指数退避、tosu 的 `error` 载荷不再被吞；tosu 重启后自动重发 `getSettings`；2.5s 无 v2 不再清屏（改为 5s 流冻结 + 状态提示），恢复后判定不丢。
+- **窗口表与回放定位**：lazer `hitWindow` 必须五项齐全才采用，否则回退 OD 窗口；helper 支持按 `.osr` 头部 md5 找 osu!lazer 命名的回放。
+- **测试**：`hook clock resyncs ...` 由 5ms 容差改为严格断言（2s 停顿后映射只前进 1ms 钩子增量），不再恒真。
+
+- **HT/DT 回放窗口**：回放判定窗口现在按 `rate` 缩放（HT ×0.75、DT ×1.5），修掉 HT 回放里完美判定偏多的问题；同图 HT+V1 录制的 note 级偏差 L1 776 → 44。
+- 测试：`node test/mrm-test.mjs` 115/115。
+
+- P3 清理：删除死代码（`lockPoint` / `state.tailIndex` / `state.exactOffset`）、补空守卫与取值 clamp、`unstableRate` 对 V1 长条去重并加 250ms 缓存、`rev` 摘要串补全、`sweepMisses` 不再受 `fpsLimit` 门控、抓谱 URL 改协议相对、进 play 清空上一局计数。
+- 工具与文档：helper 的 `.cfg` 缓存加 30s TTL、`/replay` 500 脱敏、`key-hook.ps1` 把 C# 编译产物缓存到 `%TEMP%\mrm-keyhook`（二次启动 hook 就绪 < 50ms）、`stop-helper` 如实报告、README 的 OBS URL 与目录名一致、`mrm-live-monitor` 补 `applyFilters:` 前缀、`mrm-live-check` 失败时退出码 1。
+- 测试：`node test/mrm-test.mjs` 115/115；两局 1x 录制回归判定数字与修复前逐项一致。
+
+实测（同一份 V1 录制回放对比游戏结算）：实时 note 级分布偏差 L1 448 → 68，头判类不同的 note 1195 → 264、尾判 884 → 194，`|dE| <= 5ms` 5.7% → 80.3%，着色延迟 p95 171.4 → 111.2ms。
+
+测试：`node test/mrm-test.mjs` 112/112 通过；`node test/ln-analyze.mjs --session ln-logs/session-v1-1` 与 `--session ln-logs/session-ln3` 复现上述数字。
+
+---
+
 # Mania Replay Master v0.5.3 修复说明
 
 本次针对「个别音符已经越过判定线，却一直保持未判定色 `#8fa3c8`」的问题（截图中的红框音符）：

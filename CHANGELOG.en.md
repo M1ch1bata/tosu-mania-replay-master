@@ -1,3 +1,50 @@
+# Mania Replay Master v0.5.4 — Update Notes (unreleased)
+
+This release rewrites the judgement model of the **Replay** path (the exact pipeline that reads `.osr`). Previously the replay colours drifted far from the osu! score screen, especially on long notes (whole LN recoloured, head/tail swapped, dense LN sections tinted one row after another).
+
+- **Judgement model aligned with the client**: ported from the reference implementation Mania-Replay-Master (per-lane FIFO scan, `TOO_EARLY` / `TOO_LATE` rules, the "next note in the same lane overrides lateness" check, and the "hold too long" reverse scan). V1 long notes now get a **merged head+tail** judgement (`totalDiff <= window*rate*2`); ScoreV2 keeps head/tail separate and adds the "tail demoted to MEH when the head was missed / already judged" rule.
+- **Windows are truncated integers**: V1 `[16,34,67,97,121,158] + 3*(10-OD)` with HR/EZ multipliers; ScoreV2 uses lazer's `DifficultyRange(22.4,19.4,13.9)` ranges. The game truncates, while the plugin previously added `+0.5`, which pushed boundary notes into the neighbouring class.
+- **Offset is calibrated automatically**: `fitExactOffset()` gives a rough value, then the `.osr` result counts are minimised over ±80ms in 1ms steps, removing the ~2.6s bias between the `.osr` clock and the beatmap clock (settles at -2629ms in practice).
+- **Replay file selection**: helper `/replay` accepts an optional `file=` parameter; when a map has several `.osr` files, the plugin now picks the run that matches the recording end time instead of the newest file.
+
+Measured on the same 4K LN map (OD8) against the osu! result counts: V1 L1 distance 890 → 10, ScoreV2 618 → 18.
+
+**Live-pipeline fixes in the same release** — fixing the large-scale mis-colouring seen while playing in V1:
+
+- **Long-note tails no longer claim ahead of time**: live matching is now per-lane FIFO with full window checks, and a release only judges a long note whose head was actually pressed (previously 871 releases were credited 1–164ms early to tails of notes that had not started). V1 head/tail also take the game's `hitErrors` correction instead of trusting the hook clock alone.
+- **Joint error pairing**: `hitErrors` are no longer paired by "closest error value" (dense LN sections repeat errors and shift the pairing), but by implied press time plus error value, so whole rows no longer flip class.
+- **V1 merge rule matches the client**: `|head error| + |tail error| <= window*rate*2` (rate 1.2/1.1), and a release way too early is a miss.
+- **30ms miss grace**: late `hitErrors` / key events can still claim a note at the window edge.
+
+- **ScoreV2 mass revert fixed**: ScoreV2 recalculates the score on every judgement, so releasing a hold early (re-judged as a miss) makes `play.score` dip slightly. The old restart detector treated that as a retry and called `resetJudgements()`, reverting every rendered note (including unrelated nearby LNs) to the unjudged colour. Restart detection now only looks at the hit counters (31 false resets per 164s run -> 0).
+- **ScoreV2 hold release fixed**: the client divides the release offset by 1.5 before comparing it with the windows, and caps the tail at MEH when the head was missed; we compared the raw offset, so dense LN tails came out one class too harsh. Live counts vs the result now differ by L1 106 (was 620), notes with a different tail class 656 -> 182.
+
+- **Stale replay verdicts can no longer short-circuit invalidation**: an applied exact result no longer blocks restart / rewind detection (a quick retry now drops the previous .osr verdict), and switching the judgement source mid-play clears whatever the previous mode set up.
+- **Visible-window cursor invalidates with reviewTime / scroll speed**: notes that already crossed the hit line used to stop drawing in bulk (520 missing frame-draws in 60 frames); the cursor now resets when the scroll mapping is rebuilt.
+- **Old caches are not reused**: RUN_VERSION is now 5 after the exact judgement rewrite, so replaying an old map no longer shows matches cached by the previous algorithm; stored runs are pruned by timestamp (newest 30).
+- **Offset calibration is ~5x faster**: exactOffsetFor 438ms -> 83ms (two-phase search plus a sampled fitExactOffset), so long maps no longer freeze for half a second at the start.
+- **Helper hardening**: 8MB cap on LZMA output, 24-entry osrCache bound, SSE heartbeat and dead-client cleanup, /live keys clamped to 1..18, explicit spawn / EADDRINUSE errors, and no-Origin requests are rejected.
+- **Result-level tests for the exact judge model**: window boundaries, V1 merged long notes, V2 head/tail split, late release losing only the tail, `exactOffsetFor` calibration and end-to-end `applyExactTimeline` counts are now asserted (unit tests 92 → 112).
+- **The end-to-end replay test no longer passes silently**: a missing `MRM_MAP_INDEX` prints SKIP and exits with code 2, and the helper process is killed instead of being left behind.
+- **Analyzer clock fixed**: the analyzer no longer calls `setTime()` a second time after `onV2()` already applied the song time (`dt == 0` used to pin `timeSpeed` to 1, so the DT branch was never exercised).
+
+- **Connection and stream stalls**: websockets use `wss` when the page is https, reconnect with exponential backoff, and tosu `error` payloads are no longer swallowed; `getSettings` is re-sent after a tosu restart; a 2.5s gap in v2 no longer clears the screen (5s stale-stream freeze + status hint) and judgements resume intact.
+- **Window tables and replay lookup**: the lazer `hitWindow` payload is only accepted when all five windows are present, otherwise the OD table is used; the helper now finds osu!lazer replays by reading the beatmap md5 from the `.osr` header.
+- **Tests**: the "hook clock resyncs ..." assertion is strict now (after a 2s stall the mapping only advances by the 1ms hook delta) instead of being vacuously true.
+
+- **HT/DT replay windows**: replay judgement windows are now scaled by `rate` (HT ×0.75, DT ×1.5), removing the extra perfects on HT replays; note-level L1 776 → 44 on the same HT + V1 recording.
+- Tests: `node test/mrm-test.mjs` 115/115.
+
+- P3 cleanup: removed dead code (`lockPoint`, `state.tailIndex`, `state.exactOffset`), added null guards and input clamps, `unstableRate` no longer double-counts V1 long-note tails and is cached for 250ms, the `rev` signature now covers every visual setting, `sweepMisses` is no longer throttled by `fpsLimit`, beatmap fetches use a protocol-relative URL, and a new play clears the previous run's counters.
+- Tooling/docs: helper `.cfg` cache expires after 30s, `/replay` 500 responses are sanitised, `key-hook.ps1` caches its compiled assembly in `%TEMP%\mrm-keyhook` (hook ready in < 50ms after the first spawn), `stop-helper` reports honestly, the README OBS URL matches the folder name, `mrm-live-monitor` sends the `applyFilters:` prefix, and `mrm-live-check` exits non-zero on failure.
+- Tests: `node test/mrm-test.mjs` 115/115; the two 1x recordings show identical judgement numbers before/after.
+
+Measured by replaying the same V1 recording against the game result: live note-level L1 448 → 68, notes with a different head class 1195 → 264 (tails 884 → 194), `|dE| <= 5ms` 5.7% → 80.3%, colour latency p95 171.4 → 111.2ms.
+
+Tests: 112/112 unit assertions pass; `node test/ln-analyze.mjs --session ln-logs/session-v1-1` and `--session ln-logs/session-ln3` reproduce the numbers above.
+
+---
+
 # Mania Replay Master v0.5.3 — Update Notes
 
 This patch fixes notes that stayed in the unjudged colour (`#8fa3c8`) after crossing the judgement line:

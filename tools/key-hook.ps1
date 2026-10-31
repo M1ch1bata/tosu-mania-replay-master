@@ -1,6 +1,6 @@
 param([Parameter(Mandatory=$true)][string]$Map)
 $ErrorActionPreference = "Stop"
-Add-Type -TypeDefinition @"
+$source = @"
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -26,6 +26,10 @@ public static class MrmKeyHook {
     private static LowLevelKeyboardProc procRef;
     private static Stopwatch clock;
     private static Thread writer;
+
+    private static void Emit(string line) {
+        if (!outbox.TryAdd(line)) Console.Error.WriteLine("mrm-key-hook: event queue full, dropped " + line);
+    }
 
     private static void StartWriter() {
         writer = new Thread(() => {
@@ -55,9 +59,9 @@ public static class MrmKeyHook {
                 bool isDown = msg == 0x100 || msg == 0x104;
                 bool isUp = msg == 0x101 || msg == 0x105;
                 if (isDown && pressed.Add(vk)) {
-                    outbox.TryAdd("down|" + col + "|" + Stamp());
+                    Emit("down|" + col + "|" + Stamp());
                 } else if (isUp && pressed.Remove(vk)) {
-                    outbox.TryAdd("up|" + col + "|" + Stamp());
+                    Emit("up|" + col + "|" + Stamp());
                 }
             }
         }
@@ -84,4 +88,15 @@ public static class MrmKeyHook {
     }
 }
 "@
+# The helper respawns this hook after every idle stop / SSE reconnect, and Add-Type would
+# recompile the C# each time (a few hundred ms of latency before the first key is seen).
+# Compile once into %TEMP% (name keyed by the source hash) and load the cached assembly.
+$cacheDir = Join-Path $env:TEMP "mrm-keyhook"
+$hash = [BitConverter]::ToString([System.Security.Cryptography.SHA1]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($source))).Replace("-", "").Substring(0, 12)
+$cacheDll = Join-Path $cacheDir ("MrmKeyHook-" + $hash + ".dll")
+if (-not (Test-Path -LiteralPath $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $cacheDll)) {
+    Add-Type -TypeDefinition $source -OutputAssembly $cacheDll -OutputType Library
+}
+Add-Type -Path $cacheDll
 [MrmKeyHook]::Run($Map)

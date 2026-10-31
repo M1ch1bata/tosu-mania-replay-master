@@ -108,6 +108,8 @@ const state = {
   exactFetching: false,
   exactKey: "",
   exactActions: null,
+  exactCounts: null,
+  urCache: null,
   exactRetryAt: 0,
   liveActive: false,
   liveReady: false,
@@ -135,6 +137,7 @@ const state = {
   runPrefix: [],
   nextSaveAt: 0,
   lastV2At: 0,
+  streamStale: false,
   keyHints: [],
   keyHintPressed: [false, false, false, false],
   keyHintCounts: [0, 0, 0, 0],
@@ -169,42 +172,88 @@ function hexToRgba(hex, alpha) {
   const r = parseInt(h.slice(0, 2), 16);
   const g = parseInt(h.slice(2, 4), 16);
   const b = parseInt(h.slice(4, 6), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
+  const a = Number.isFinite(Number(alpha)) ? Math.max(0, Math.min(1, Number(alpha))) : 1;
+  return `rgba(${r},${g},${b},${a})`;
 }
+
+const SOCKET_BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
+let socketErrorText = "";
 
 class SocketManager {
   constructor(host) {
     this.host = host;
     this.sockets = {};
+    this.retries = {};
+    this.reopeners = {};
   }
-  open(path, onMessage, filters) {
+  open(path, onMessage, filters, onOpen) {
     if (this.sockets[path]) return;
-    const url = `ws://${this.host}${path}?l=${encodeURIComponent(window.COUNTER_PATH || "")}`;
+    // Reopening has to re-announce the settings request too, otherwise a tosu restart
+    // leaves the overlay on its default settings for the rest of the session.
+    if (onOpen) this.reopeners[path] = onOpen;
+    const proto = location.protocol === "https:" ? "wss://" : "ws://";
+    const url = `${proto}${this.host}${path}?l=${encodeURIComponent(window.COUNTER_PATH || "")}`;
     let ws;
     try {
       ws = new WebSocket(url);
     } catch (err) {
-      setTimeout(() => this.open(path, onMessage, filters), 1000);
+      this.retry(path, onMessage, filters, onOpen);
       return;
     }
     this.sockets[path] = ws;
     ws.onopen = () => {
+      this.retries[path] = 0;
       if (filters) ws.send(`applyFilters:${JSON.stringify(filters)}`);
+      const cb = this.reopeners[path];
+      if (cb) {
+        try {
+          cb();
+        } catch (err) {
+          console.error("[ManiaReplayMaster]", err);
+        }
+      }
     };
     ws.onclose = () => {
       delete this.sockets[path];
-      setTimeout(() => this.open(path, onMessage, filters), 1000);
+      this.retry(path, onMessage, filters, onOpen);
     };
-    ws.onerror = () => {};
+    ws.onerror = () => {
+      // onclose follows and schedules the reconnect; the browser gives no detail here.
+    };
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data && typeof data === "object" && "error" in data) return;
+        if (data && typeof data === "object" && "error" in data) {
+          // tosu reports filter/socket problems inside the payload; they used to be dropped.
+          const detail = typeof data.error === "string" ? data.error : JSON.stringify(data.error);
+          if (detail && detail !== socketErrorText) {
+            socketErrorText = detail;
+            console.warn("[ManiaReplayMaster] tosu socket error:", detail);
+          }
+          return;
+        }
+        socketErrorText = "";
         onMessage(data);
       } catch (err) {
         console.error("[ManiaReplayMaster]", err);
       }
     };
+  }
+  retry(path, onMessage, filters, onOpen) {
+    const n = Math.min((this.retries[path] || 0) + 1, SOCKET_BACKOFF_MS.length);
+    this.retries[path] = n;
+    setTimeout(() => this.open(path, onMessage, filters, onOpen), SOCKET_BACKOFF_MS[n - 1]);
+  }
+  closeAll() {
+    for (const key of Object.keys(this.sockets)) {
+      const ws = this.sockets[key];
+      delete this.sockets[key];
+      try {
+        ws.close();
+      } catch (err) {
+        /* already closed */
+      }
+    }
   }
   send(path, text) {
     const ws = this.sockets[path];
@@ -237,6 +286,9 @@ function setTime(t) {
 }
 
 function renderTime() {
+  // A stalled v2 stream means the extrapolated song clock is no longer anchored to the
+  // game; freeze on the last sample instead of drifting ahead of the playfield.
+  if (state.streamStale) return state.time;
   const now = performance.now();
   const age = now - state.timeLocal;
   // A stale time sample means the v2 stream stalled (pause, webview/GC stall, tosu hiccup).
@@ -423,7 +475,9 @@ function updateWindows() {
   let w;
   if (state.client === "stable") {
     w = localWindows();
-  } else if (hw && num(hw.perfect, 0) > 0 && num(hw.miss, 0) > 0) {
+  } else if (hw && WINDOW_KEYS.every((k) => num(hw[k], 0) > 0)) {
+    // A lazer payload with a missing window key used to yield a 0ms window, which made
+    // every judgement MEH/MISS; require the complete set and fall back to OD windows.
     const rate = state.modsRate || 1;
     w = WINDOW_KEYS.map((k) => num(hw[k], 0) * rate);
   } else {
@@ -434,9 +488,19 @@ function updateWindows() {
   state.windowSig = sig;
   state.windows = w;
   const pts = state.points;
-  if (pts) {
+  if (pts && !state.exactApplied) {
     for (const p of pts) {
-      if (p.matched && p.e !== null) p.j = classifyError(p.e);
+      if (!p.matched || p.e === null) continue;
+      p.j = state.scoreV2 && p.end ? classifyV2Tail(p.note, p.e) : classifyError(p.e);
+      // The note-level colours are what the renderer reads; keeping them in sync with the
+      // point classes avoids "pips are one colour, notes another" after OD/mods changes.
+      const ns = state.noteState && state.noteState[p.note];
+      if (!ns) continue;
+      if (p.end) {
+        if (state.scoreV2) ns.tail = p.j;
+      } else {
+        ns.head = p.j;
+      }
     }
   }
   if (!state.scoreV2 && state.beatmap && state.beatmap.notes && state.noteState) {
@@ -454,11 +518,53 @@ function classifyError(e) {
   return 4;
 }
 
+// V1 stable judges a long note as ONE judgement: the head and tail distances are
+// summed and compared against a slightly relaxed window (rate 1.2 / 1.1 for MAX / 300).
+// ScoreV2 judges a hold release on its own: the release distance is divided by 1.5
+// before it is compared with the usual windows, and an unreleased head degrades the
+// tail to MEH (see judgeRelease in the reference implementation).
+function classifyV2Tail(noteIdx, endError) {
+  const w = state.windows;
+  if (!w) return 4;
+  let j = classifyError(Math.abs(endError) / 1.5);
+  const nps = state.notePoints;
+  const np = nps && nps[noteIdx];
+  const head = np && np.head;
+  const headOk = !!(head && head.matched && head.j >= 0);
+  if (!headOk && j >= 0 && j <= 3) j = 4;
+  return j;
+}
+
+// A ScoreV2 tail is judged on its own, but a release that arrives before its head was
+// claimed is temporarily degraded to MEH. When the head shows up later, the tail has to be
+// re-judged with the same rule as a normally ordered release, otherwise it stays MEH.
+function refreshV2Tail(noteIdx) {
+  if (!state.scoreV2) return;
+  const nps = state.notePoints;
+  const ns = state.noteState;
+  const np = nps && nps[noteIdx];
+  if (!np || !np.tail || !np.tail.matched || np.tail.e === null) return;
+  if (!ns || !ns[noteIdx]) return;
+  const j = classifyV2Tail(noteIdx, np.tail.e);
+  if (np.tail.j === j) return;
+  np.tail.j = j;
+  ns[noteIdx].tail = j;
+}
+
 function classifyLongNote(startError, endError) {
   const w = state.windows;
   if (!w) return 4;
-  const avg = (Math.abs(startError) + Math.abs(endError)) / 2;
-  for (let i = 0; i < w.length - 1; i++) if (avg <= w[i]) return i;
+  const a = Math.abs(startError);
+  const b = Math.abs(endError);
+  const missW = w[w.length - 1];
+  if (endError < -missW) return -1;
+  const total = a + b;
+  const rates = [1.2, 1.1, 1.0, 1.0];
+  const n = Math.min(4, w.length - 1);
+  for (let i = 0; i < n; i++) {
+    const lim = w[i] * rates[i];
+    if (a <= lim && total <= lim * 2) return i;
+  }
   return 4;
 }
 
@@ -512,10 +618,8 @@ function buildPoints() {
   state.notePoints = notePoints;
   state.noteState = map && map.notes ? map.notes.map(() => ({ head: null, tail: null, extra: [] })) : [];
   state.columnPoints = Array.from({ length: map ? map.keys : 0 }, () => []);
-  state.tailIndex = map && map.notes ? new Array(map.notes.length).fill(-1) : [];
   for (let i = 0; i < pts.length; i++) {
     state.columnPoints[pts[i].column].push(i);
-    if (pts[i].end) state.tailIndex[pts[i].note] = i;
   }
   state.windowSig = "";
   resetJudgements();
@@ -531,10 +635,22 @@ function resetJudgements() {
   state.sweepFrom = 0;
   state.backfillFloor = -Infinity;
   state.keyHints.length = 0;
+  state.keyHintPressed.length = 0;
+  state.keyHintCounts.length = 0;
+  state.keyHintExposed = [];
+  state.keyHintSlotCount = 0;
+  state.keyHintLogged = false;
   state.livePending.length = 0;
   state.liveRecentErrors.length = 0;
   state.liveErrorCount = 0;
   state.liveBias = 0;
+  // Everything below was derived from the judgements we just dropped: keep none of it, or a
+  // later applyExactData()/ensureLive() short-circuits on stale state and the fresh run is
+  // never judged.
+  state.exactApplied = false;
+  state.exactKey = "";
+  state.exactActions = null;
+  state.exactCounts = null;
   const pts = state.points || [];
   for (const p of pts) {
     p.matched = false;
@@ -596,12 +712,21 @@ function processError(e, pressTime) {
     // miss is pending, that note cannot be a skipped one: the delayed hitError belongs to
     // it, not to a later note. Matching by note order avoids crediting the later note and
     // leaving this one unjudged forever.
+    const map = state.beatmap;
     let firstUnmatched = -1;
     for (let i = 0; i < pts.length; i++) {
-      if (!pts[i].matched) {
-        firstUnmatched = i;
-        break;
+      const cand = pts[i];
+      if (cand.matched) continue;
+      // V1 long note heads are deliberately never swept as misses (sweepMisses skips them),
+      // so an old hold head can look like "the skipped note" forever. Letting the fallback
+      // below claim it would turn a long note nobody pressed into a MAX long note and steal
+      // the hitError from the note that was actually hit.
+      if (!state.scoreV2 && !cand.end) {
+        const n = map && map.notes[cand.note];
+        if (n && n.hold) continue;
       }
+      firstUnmatched = i;
+      break;
     }
     if (firstUnmatched >= 0 && !canMarkMiss() && implied - pts[firstUnmatched].time > 260) {
       matchPoint(pts[firstUnmatched], e, near);
@@ -633,7 +758,7 @@ function addErrorStat(e) {
 function applyMatch(p, e) {
   p.matched = true;
   p.e = e;
-  p.j = classifyError(e);
+  p.j = state.scoreV2 && p.end ? classifyV2Tail(p.note, e) : classifyError(e);
   p.at = p.time + e;
   const ns = state.noteState[p.note];
   if (ns) {
@@ -643,6 +768,7 @@ function applyMatch(p, e) {
       ns.head = p.j;
     }
   }
+  if (state.scoreV2 && !p.end) refreshV2Tail(p.note);
   if (!state.scoreV2 && p.end) {
     const head = state.notePoints[p.note] && state.notePoints[p.note].head;
     if (head && !head.matched) head.matched = true;
@@ -652,6 +778,7 @@ function applyMatch(p, e) {
 }
 
 function markPointMiss(p) {
+  if (!p || !state.beatmap || !state.beatmap.notes || !state.beatmap.notes[p.note]) return;
   const n = state.beatmap.notes[p.note];
   if (!state.scoreV2 && n.hold) {
     p.matched = true;
@@ -715,7 +842,7 @@ function updateKeyHints(keys) {
     const pressed = !!btn.isPressed;
     const count = num(btn.count, 0);
     if (count > state.keyHintCounts[i]) {
-      const delta = Math.min(4, count - state.keyHintCounts[i]);
+      const delta = Math.min(16, count - state.keyHintCounts[i]);
       for (let d = 0; d < delta; d++) pushKeyHint(i, "press");
       state.keyHintExposed[i] = true;
       state.keyHintSeen = true;
@@ -812,7 +939,7 @@ function canMarkMiss() {
 function markCandidateMiss(idx) {
   const pts = state.points;
   const p = pts[idx];
-  if (!p || !state.beatmap.notes[p.note]) return false;
+  if (!p || !state.beatmap || !state.beatmap.notes || !state.beatmap.notes[p.note]) return false;
   markPointMiss(p);
   state.markedMiss += 1;
   let sf = state.searchFrom;
@@ -824,6 +951,7 @@ function markCandidateMiss(idx) {
 function consumeMissSkips() {
   if (!hitsAvailable()) return;
   const pts = state.points || [];
+  const now = renderTime();
   let guard = 0;
   while (canMarkMiss() && guard < 100) {
     let idx = -1;
@@ -831,6 +959,9 @@ function consumeMissSkips() {
       const p = pts[i];
       if (p.matched) continue;
       if (p.time < state.backfillFloor) continue;
+      // A stale miss counter (counters can lag the note stream, especially right after a
+      // restart) must never burn notes that have not even been reached yet.
+      if (p.time > now + 60) return;
       idx = i;
       break;
     }
@@ -849,9 +980,12 @@ function sweepMisses(t) {
   const map = state.beatmap;
   if (!w || !pts || !map) return;
   const missW = w[w.length - 1];
+  // Small grace: the game's own hitErrors arrive one poll (10ms) late, and a delayed
+  // key event can still claim a note right around the window edge.
+  const missGrace = 30;
   for (let i = state.sweepFrom; i < pts.length; i++) {
     const p = pts[i];
-    if (p.time > t - missW) break;
+    if (p.time > t - missW - missGrace) break;
     if (p.matched) continue;
     const n = map.notes[p.note];
     if (!state.scoreV2 && n.hold && !p.end) continue;
@@ -865,7 +999,7 @@ function sweepMisses(t) {
 }
 
 const runMemory = new Map();
-const RUN_VERSION = 4;
+const RUN_VERSION = 5; // bumped in 0.5.4: the exact judgement model changed, old cached runs must not be reused
 const RUN_MEMORY_LIMIT = 60;
 
 function trimRunMemory() {
@@ -886,10 +1020,24 @@ function pruneStoredRuns() {
   } catch {
     return;
   }
-  const drop = Math.max(1, Math.ceil(keys.length / 2));
-  for (let i = 0; i < drop && i < keys.length; i++) {
+  // Drop whole keys from the oldest side (by run timestamp) instead of blindly
+  // deleting the first half of the key list, which may hold the freshest runs.
+  const entries = [];
+  for (const key of keys) {
+    let runs = [];
     try {
-      localStorage.removeItem(keys[i]);
+      const parsed = JSON.parse(localStorage.getItem(key) || "null");
+      runs = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.matches) ? [parsed] : [];
+    } catch {
+      runs = [];
+    }
+    for (const run of runs) entries.push({ key, ts: num(run && run.ts, 0) });
+  }
+  entries.sort((a, b) => b.ts - a.ts);
+  const dropKeys = new Set(entries.slice(30).map((x) => x.key));
+  for (const key of dropKeys) {
+    try {
+      localStorage.removeItem(key);
     } catch {
     }
   }
@@ -916,6 +1064,9 @@ function loadRuns() {
 function saveRun(complete) {
   const key = runStorageKey();
   if (!key || state.cached || !state.points) return;
+  const now = Date.now();
+  if (!complete && state.lastRunSaveAt && now - state.lastRunSaveAt < 5000) return;
+  state.lastRunSaveAt = now;
   const matches = [];
   for (let i = 0; i < state.points.length; i++) {
     const p = state.points[i];
@@ -1046,15 +1197,40 @@ function fitExactOffset(notes, keys, actions) {
     }
     return s;
   };
+  // The +-12s scan is a coarse first guess only: a 4x thinner sample finds the same peak
+  // while keeping map starts cheap (it used to run 961 full scoring passes).
+  const coarseStride = Math.max(3, Math.round(actions.length / 100));
+  const coarseSample = actions.filter((_, i) => i % coarseStride === 0);
+  const coarseSoft = (off) => {
+    let s = 0;
+    for (const a of coarseSample) {
+      const d = dist(cols[a.column], a.time + off);
+      if (d <= 15) s += (15 - d) / 15;
+    }
+    return s;
+  };
   const hard = (off) => {
     let hits = 0;
     for (const a of sample) if (dist(cols[a.column], a.time + off) <= 15) hits += 1;
     return hits;
   };
+  // hard*1000 + soft in a single pass (the refine scan used to walk the sample twice).
+  const score = (off) => {
+    let hits = 0;
+    let s = 0;
+    for (const a of sample) {
+      const d = dist(cols[a.column], a.time + off);
+      if (d <= 15) {
+        hits += 1;
+        s += (15 - d) / 15;
+      }
+    }
+    return hits * 1000 + s;
+  };
   let bestOff = 0;
   let bestScore = -1;
   for (let off = -12000; off <= 12000; off += 25) {
-    const s = soft(off);
+    const s = coarseSoft(off);
     if (s > bestScore) {
       bestScore = s;
       bestOff = off;
@@ -1063,7 +1239,7 @@ function fitExactOffset(notes, keys, actions) {
   const coarse = bestOff;
   bestScore = -1;
   for (let off = coarse - 40; off <= coarse + 40; off += 1) {
-    const s = hard(off) * 1000 + soft(off);
+    const s = score(off);
     if (s > bestScore) {
       bestScore = s;
       bestOff = off;
@@ -1072,19 +1248,241 @@ function fitExactOffset(notes, keys, actions) {
   return bestOff;
 }
 
-function lockPoint(column, time, wantEnd, claimed, window) {
-  const list = state.columnPoints && state.columnPoints[column];
-  const pts = state.points;
-  if (!list || !pts) return -1;
-  for (const i of list) {
-    const p = pts[i];
-    if (!!p.end !== wantEnd) continue;
-    if (claimed ? claimed[i] : p.matched) continue;
-    if (p.time < time - window) continue;
-    if (p.time - time > window) return -1;
-    return i;
+// Replay judging model ported from Mania-Replay-Master (Keytoyze, Apache-2.0).
+// It matches osu!stable's own replay re-judging closely, including the
+// ScoreV2 long-note rules (head + tail judged separately, tail downgraded to
+// MEH when the head is missing/missed, "hold too long" too-late detection).
+const J_EARLY = -1;
+const J_HIT = 0;
+const J_HIT_AGAIN = 1;
+const J_LATE = 2;
+
+// stable judges in real time, so in song time the effective window scales with the
+// playback rate (HT 0.75 -> x0.75, DT 1.5 -> x1.5). The live path already applied this
+// in localWindows(); the replay path used to skip it, which inflated impossible-perfect
+// notes on HT/DT replays (measured: HT V1 L1 776 -> 44 against the game counts).
+function scaleReplayWindows(w) {
+  const rate = state.modsRate || 1;
+  if (rate === 1) return w;
+  return w.map((v) => v * rate);
+}
+
+function replayWindowTable(scoreV2) {
+  const od = clamp(state.odConverted > 0 ? state.odConverted : state.od, 0, 10);
+  const mods = num(state.modsNumber, 0);
+  const hr = (mods & (1 << 4)) !== 0;
+  const ez = (mods & (1 << 1)) !== 0;
+  if (scoreV2) {
+    const diff = hr ? Math.min(10, od * 1.4) : ez ? Math.max(0, od / 2) : od;
+    const range = (min, mid, max) => {
+      const v = diff > 5 ? mid + ((max - mid) * (diff - 5)) / 5 : diff < 5 ? mid - ((mid - min) * (5 - diff)) / 5 : mid;
+      return Math.trunc(v);
+    };
+    return scaleReplayWindows([
+      range(22.4, 19.4, 13.9),
+      range(64, 49, 34),
+      range(97, 82, 67),
+      range(127, 112, 97),
+      range(151, 136, 121),
+      range(188, 173, 158)
+    ]);
   }
+  const modeRate = hr ? 1 / 1.4 : ez ? 1.4 : 1;
+  return scaleReplayWindows([16, 34, 67, 97, 121, 158].map((d, i) => Math.trunc((i === 0 ? d : d + 3 * (10 - od)) * modeRate)));
+}
+
+function getJudgementClass(diff, w) {
+  for (let i = 0; i < w.length - 1; i++) if (diff <= w[i]) return i;
   return -1;
+}
+
+function judgeRelease(action, targetIdx, notes, results, w, scoreV2, judged) {
+  const note = notes[targetIdx];
+  const res = results[targetIdx];
+  const endDiff = Math.abs(action.endTime - note.endTime);
+  const signed = action.endTime - note.endTime;
+  let endJ = signed <= w[3] * 1.5 ? getJudgementClass(endDiff / 1.5, w) : -1;
+  if (judged[targetIdx] || res.start === -1 || res.start === 5) {
+    if (endJ >= 0 && endJ <= 3) endJ = 4;
+  }
+  res.end = endJ;
+  res.actionEnd = action.index;
+  res.endErr = action.endTime - note.endTime;
+  let startDiff = Math.abs(action.time - note.time);
+  if (note.time - w[4] > action.time) startDiff = Math.abs(note.time - (note.endTime - 1));
+  const totalDiff = startDiff + endDiff;
+  let total;
+  let canAgain;
+  if (action.endTime - note.endTime < -w[4]) {
+    total = -1;
+    canAgain = true;
+  } else {
+    canAgain = false;
+    const ok = (j, rate) => startDiff <= w[j] * rate && totalDiff <= w[j] * rate * 2;
+    total = ok(0, 1.2) ? 0 : ok(1, 1.1) ? 1 : ok(2, 1) ? 2 : ok(3, 1) ? 3 : 4;
+  }
+  if (judged[targetIdx] && (total === 0 || total === 1)) total = 2;
+  judged[targetIdx] = 1;
+  res.total = total;
+  if (!scoreV2) res.start = total;
+  return canAgain;
+}
+
+function judgeReplayNotes(notes, actions, w, scoreV2, adjust) {
+  const keys = state.beatmap ? state.beatmap.keys : 4;
+  const colNotes = Array.from({ length: keys }, () => []);
+  const colPos = new Array(notes.length).fill(-1);
+  for (let i = 0; i < notes.length; i++) {
+    const c = notes[i].column;
+    if (!(c >= 0 && c < keys)) continue;
+    colPos[i] = colNotes[c].length;
+    colNotes[c].push(i);
+  }
+  const results = notes.map(() => ({ start: -1, end: -1, actionStart: -1, actionEnd: -1, startErr: null, endErr: null, total: -1 }));
+  const dead = new Uint8Array(notes.length);
+  const cannot = new Uint8Array(notes.length);
+  const judged = new Uint8Array(notes.length);
+  const cursor = new Int32Array(keys);
+  const canHit = (action, idx) => {
+    const note = notes[idx];
+    if (action.column !== note.column) return -1;
+    const diff = action.time - note.time;
+    if (-diff > w[5]) return J_EARLY;
+    const hold = note.endTime > note.time;
+    if (!hold) return diff >= w[3] ? J_LATE : J_HIT;
+    const v2Scale = scoreV2 ? 1.5 : 1;
+    let isTooLate = action.time - note.endTime > w[3] * v2Scale;
+    if (adjust) {
+      const list = colNotes[note.column];
+      const pos = colPos[idx];
+      const nextIdx = pos >= 0 && pos + 1 < list.length ? list[pos + 1] : -1;
+      if (nextIdx >= 0) {
+        const next = notes[nextIdx];
+        const nextDiff = next.time - note.time;
+        const limit = nextDiff < w[4] ? next.time - 1 : nextDiff > w[4] * 2 ? next.time - w[4] : note.time + w[4];
+        isTooLate = action.time > limit;
+      }
+    }
+    if (isTooLate) return J_LATE;
+    for (let j = action.index - 1; j >= 0; j--) {
+      const another = actions[j];
+      if (another.column !== action.column) continue;
+      const endTime = another.endTime;
+      if (endTime < note.endTime - w[4]) break;
+      const rel = another.related >= 0 ? notes[another.related] : null;
+      const isHoldTooLong = endTime > (rel ? rel.endTime : 0) + w[3] * v2Scale;
+      if (!isHoldTooLong && rel) continue;
+      if (endTime < note.endTime + w[3] * v2Scale && endTime > note.time + w[4]) return J_LATE;
+    }
+    return J_HIT_AGAIN;
+  };
+  for (const action of actions) {
+    const list = colNotes[action.column];
+    if (!list) continue;
+    let c = cursor[action.column];
+    let target = -1;
+    while (c < list.length) {
+      const idx = list[c];
+      if (dead[idx]) {
+        c += 1;
+        continue;
+      }
+      const r = canHit(action, idx);
+      if (r === J_EARLY) break;
+      if (r === J_LATE || cannot[idx]) {
+        dead[idx] = 1;
+        c += 1;
+        continue;
+      }
+      target = idx;
+      if (r !== J_HIT_AGAIN) {
+        dead[idx] = 1;
+        c += 1;
+      }
+      break;
+    }
+    cursor[action.column] = c;
+    if (target < 0) continue;
+    const note = notes[target];
+    const res = results[target];
+    const judgement = getJudgementClass(Math.abs(action.time - note.time), w);
+    if (res.start === -1) res.start = judgement;
+    action.related = target;
+    res.actionStart = action.index;
+    res.startErr = action.time - note.time;
+    if (note.endTime > note.time) {
+      const canAgain = judgeRelease(action, target, notes, results, w, scoreV2, judged);
+      if (!canAgain) cannot[target] = 1;
+    }
+  }
+  return results;
+}
+
+function replayJudgementCounts(notes, results, scoreV2) {
+  const counts = [0, 0, 0, 0, 0, 0];
+  for (let i = 0; i < notes.length; i++) {
+    const r = results[i];
+    counts[r.start < 0 || r.start > 5 ? 5 : r.start] += 1;
+    if (scoreV2 && notes[i].endTime > notes[i].time) {
+      counts[r.end < 0 || r.end > 5 ? 5 : r.end] += 1;
+    }
+  }
+  return counts;
+}
+
+function osrCountsToClasses(counts) {
+  if (!Array.isArray(counts) || counts.length < 6) return null;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  return [n(counts[3]), n(counts[0]), n(counts[4]), n(counts[1]), n(counts[2]), n(counts[5])];
+}
+
+// The helper decodes .osr frame times on a clock that runs ~2.6s ahead of the
+// beatmap clock, so the offset must be recovered from the data. fitExactOffset
+// gives a coarse estimate; when the replay's own hit counts are available we
+// refine it by minimizing the count mismatch against them.
+function exactOffsetFor(actions) {
+  const map = state.beatmap;
+  if (!map || !map.notes) return 0;
+  const fit = fitExactOffset(map.notes, map.keys, actions);
+  const target = osrCountsToClasses(state.exactCounts);
+  if (!target) return fit;
+  const sv2 = !!state.scoreV2;
+  const w = replayWindowTable(sv2);
+  const sorted = actions
+    .map((a, i) => ({ column: a.column, time: a.time, endTime: a.endTime, index: i, related: -1 }))
+    .filter((a) => Number.isFinite(a.time) && Number.isFinite(a.endTime) && Number.isInteger(a.column) && a.column >= 0 && a.column < map.keys)
+    .sort((x, y) => x.time - y.time);
+  if (!sorted.length) return fit;
+  for (let i = 0; i < sorted.length; i++) sorted[i].index = i;
+  const evaluate = (off) => {
+    const acts = sorted.map((a) => ({ column: a.column, time: a.time + off, endTime: a.endTime + off, index: a.index, related: -1 }));
+    const res = judgeReplayNotes(map.notes, acts, w, sv2, true);
+    const counts = replayJudgementCounts(map.notes, res, sv2);
+    let l1 = 0;
+    for (let i = 0; i < counts.length; i++) l1 += Math.abs(counts[i] - target[i]);
+    return l1;
+  };
+  let best = fit;
+  let bestL1 = Infinity;
+  // Coarse pass (5ms steps) then refine ±4ms around the winner: same result for every
+  // offset that a 1ms scan could pick, but ~5x fewer full re-judgements (161 -> 33).
+  for (let off = fit - 40; off <= fit + 40; off += 8) {
+    const l1 = evaluate(off);
+    if (l1 < bestL1 || (l1 === bestL1 && Math.abs(off - fit) < Math.abs(best - fit))) {
+      bestL1 = l1;
+      best = off;
+    }
+  }
+  const coarse = best;
+  for (let off = coarse - 7; off <= coarse + 7; off += 1) {
+    if (off === coarse) continue;
+    const l1 = evaluate(off);
+    if (l1 < bestL1 || (l1 === bestL1 && Math.abs(off - fit) < Math.abs(best - fit))) {
+      bestL1 = l1;
+      best = off;
+    }
+  }
+  return best;
 }
 
 function applyExactTimeline(actions, offset) {
@@ -1092,49 +1490,76 @@ function applyExactTimeline(actions, offset) {
   const pts = state.points;
   if (!map || !pts || !pts.length || !actions || !actions.length) return false;
   resetJudgements();
-  const w = state.windows && state.windows.length ? state.windows : localWindows();
-  const missW = w[w.length - 1];
-  const claimed = new Uint8Array(pts.length);
-  let lastT = 0;
-  for (const a of actions) {
-    const t = a.time + offset;
-    if (t > lastT) lastT = t;
-    const head = lockPoint(a.column, t, false, claimed, missW);
-    if (head < 0) continue;
-    claimed[head] = 1;
-    const target = pts[head];
-    applyMatch(target, t - target.time);
-    if (map.notes[target.note] && map.notes[target.note].hold) {
-      const tailIdx = state.tailIndex ? state.tailIndex[target.note] : -1;
-      if (tailIdx >= 0 && !claimed[tailIdx]) {
-        const tail = pts[tailIdx];
-        const tailErr = a.endTime + offset - tail.time;
-        if (Math.abs(tailErr) <= missW) {
-          claimed[tailIdx] = 1;
-          applyMatch(tail, tailErr);
-        }
+  const w = replayWindowTable(!!state.scoreV2);
+  const sorted = actions
+    .map((a, i) => ({ column: a.column, time: a.time + offset, endTime: a.endTime + offset, index: i, related: -1 }))
+    .filter((a) => Number.isFinite(a.time) && Number.isFinite(a.endTime) && Number.isInteger(a.column) && a.column >= 0 && a.column < map.keys)
+    .sort((x, y) => x.time - y.time);
+  if (!sorted.length) return false;
+  for (let i = 0; i < sorted.length; i++) sorted[i].index = i;
+  const results = judgeReplayNotes(map.notes, sorted, w, !!state.scoreV2, true);
+  let lastT = -Infinity;
+  for (const a of sorted) if (a.time > lastT) lastT = a.time;
+  let misses = 0;
+  let statCount = 0;
+  let sum = 0;
+  let sq = 0;
+  for (let i = 0; i < map.notes.length; i++) {
+    const n = map.notes[i];
+    const r = results[i];
+    const np = state.notePoints[i];
+    const ns = state.noteState[i];
+    if (!np || !ns) continue;
+    if (r.start === -1) {
+      for (const p of [np.head, np.tail]) {
+        if (!p) continue;
+        p.matched = true;
+        p.j = -1;
+        p.e = null;
+        p.at = p.time;
       }
+      ns.head = -1;
+      if (n.hold) ns.tail = -1;
+      misses += 1;
+      continue;
+    }
+    const startErr = Number.isFinite(r.startErr) ? r.startErr : 0;
+    if (np.head) {
+      np.head.matched = true;
+      np.head.j = r.start;
+      np.head.e = startErr;
+      np.head.at = np.head.time + startErr;
+      statCount += 1;
+      sum += startErr;
+      sq += startErr * startErr;
+    }
+    ns.head = r.start;
+    if (n.hold && np.tail) {
+      // V1 keeps one combined judgement for the whole long note (like stable
+      // and like the reference renderer); V2 keeps head and tail apart.
+      const tailJ = state.scoreV2 ? (r.end === -1 ? -1 : r.end) : r.start;
+      const tailErr = Number.isFinite(r.endErr) ? r.endErr : startErr;
+      np.tail.matched = true;
+      np.tail.j = tailJ;
+      np.tail.e = tailErr;
+      np.tail.at = np.tail.time + tailErr;
+      ns.tail = tailJ;
+      statCount += 1;
+      sum += tailErr;
+      sq += tailErr * tailErr;
     }
   }
-  let misses = 0;
-  for (let i = 0; i < pts.length; i++) {
-    if (claimed[i]) continue;
-    const p = pts[i];
-    if (p.time > lastT + missW) continue;
-    const n = map.notes[p.note];
-    if (!n) continue;
-    if (!state.scoreV2 && n.hold && p.end) continue;
-    markPointMiss(p);
-    misses += 1;
-  }
-  const lastNote = map.notes.length ? map.notes[map.notes.length - 1] : null;
-  const complete = !!lastNote && lastT >= lastNote.endTime - 1000;
-  saveRun(complete);
   state.markedMiss = misses;
+  state.statCount = statCount;
+  state.errorSum = sum;
+  state.errorSq = sq;
+  state.errorCount = statCount;
   state.searchFrom = pts.length;
   state.sweepFrom = pts.length;
-  state.errorCount = state.statCount;
   state.pendingApply = false;
+  const lastNote = map.notes.length ? map.notes[map.notes.length - 1] : null;
+  const complete = !!lastNote && Number.isFinite(lastT) && lastT >= lastNote.endTime - 1000;
+  saveRun(complete);
   state.cached = true;
   state.cachedErrors = [];
   state.cacheChecked = 0;
@@ -1149,8 +1574,14 @@ function applyExactData() {
   if (mode === "Live") return false;
   if (state.liveActive) return false;
   if (mode === "Auto" && !exactReplayReady()) return false;
-  const offset = fitExactOffset(state.beatmap.notes, state.beatmap.keys, state.exactActions);
-  return applyExactTimeline(state.exactActions, offset);
+  try {
+    const offset = exactOffsetFor(state.exactActions);
+    return applyExactTimeline(state.exactActions, offset);
+  } catch (err) {
+    console.error("[ManiaReplayMaster] exact replay failed:", err);
+    clearExactState();
+    return false;
+  }
 }
 
 function exactReplayReady() {
@@ -1158,7 +1589,9 @@ function exactReplayReady() {
   const notes = state.beatmap && state.beatmap.notes;
   const first = notes && notes.length ? notes[0].time : 0;
   if (renderTime() < first + 1000) return false;
-  if (settings.exactLive && state.liveSource && state.liveSource.readyState === 1 && !state.liveReady) return false;
+  // Only Auto mode has to wait for the keyboard hook: an explicit Replay mode should keep
+  // using the .osr even when the hook could not start.
+  if (analysisMode() === "Auto" && settings.exactLive && state.liveSource && state.liveSource.readyState === 1 && !state.liveReady) return false;
   return true;
 }
 
@@ -1179,11 +1612,15 @@ async function maybeExact() {
   state.exactFetching = true;
   const token = state.loadToken;
   let found = null;
+  let foundCounts = null;
   let ok = false;
   try {
     const res = await helperFetch(helperEndpoint(`/replay?md5=${state.checksum}&keys=${state.beatmap.keys}`), 3000);
     const data = await res.json();
-    if (data && data.found && Array.isArray(data.actions)) found = data.actions;
+    if (data && data.found && Array.isArray(data.actions)) {
+      found = data.actions;
+      foundCounts = Array.isArray(data.counts) ? data.counts : null;
+    }
     ok = true;
   } catch {
     ok = false;
@@ -1194,6 +1631,7 @@ async function maybeExact() {
   if (ok && found) {
     state.exactKey = key;
     state.exactActions = found;
+    state.exactCounts = foundCounts;
     applyExactData();
   } else {
     state.exactRetryAt = performance.now() + 5000;
@@ -1224,6 +1662,7 @@ function clearExactState() {
   state.exactApplied = false;
   state.exactKey = "";
   state.exactActions = null;
+  state.exactCounts = null;
   state.exactFetching = false;
   state.exactRetryAt = 0;
 }
@@ -1241,17 +1680,52 @@ function resetExactRun() {
   closeLive();
 }
 
+function liveMissWindow() {
+  const w = state.windows || localWindows();
+  return w && w.length ? w[w.length - 1] : 0;
+}
+
+// Live matching: same "earliest still-valid note in the lane" rule as the client,
+// but with full window checks on both sides. Points that are already past the miss
+// window are consumed as misses (the client does the same), so a lane cannot be
+// blocked by a stale note.
+function lockLivePoint(column, t, wantEnd) {
+  const list = state.columnPoints && state.columnPoints[column];
+  const pts = state.points;
+  if (!list || !pts) return -1;
+  const missW = liveMissWindow();
+  const nps = state.notePoints;
+  for (const i of list) {
+    const p = pts[i];
+    if (!!p.end !== wantEnd) continue;
+    if (p.matched) continue;
+    if (wantEnd) {
+      // A tail is only valid once its head was really claimed. V1 additionally requires a
+      // real judgement (j >= 0): a head merely queued as miss cannot start an LN.
+      const np = nps && nps[p.note];
+      if (!np || !np.head || !np.head.matched) continue;
+      if (!state.scoreV2 && np.head.j < 0) continue;
+    }
+    if (p.time - t > missW) return -1;
+    if (t - p.time > missW) {
+      markPointMiss(p);
+      state.markedMiss += 1;
+      continue;
+    }
+    return i;
+  }
+  return -1;
+}
+
 function applyLiveKey(column, t, down) {
   const w = state.windows || localWindows();
   if (!state.points || !w || !w.length) return;
-  const best = lockPoint(column, t, !down, null, w[w.length - 1]);
+  const best = lockLivePoint(column, t, !down);
   if (best < 0) return;
   const point = state.points[best];
   const e = t - point.time;
   applyMatch(point, e);
-  const note = state.beatmap && state.beatmap.notes && state.beatmap.notes[point.note];
-  const canCorrect = state.scoreV2 || !note || !note.hold;
-  if (canCorrect) {
+  {
     const now = performance.now();
     const implied = renderTime();
     let matched = -1;
@@ -1290,14 +1764,37 @@ function correctLiveError(eGame) {
   const now = performance.now();
   const implied = renderTime() - eGame;
   let best = null;
+  let bestIdx = -1;
   let bestScore = Infinity;
-  for (const entry of state.livePending) {
-    if (now - entry.at > 300) continue;
-    if (Math.abs(entry.point.time - implied) > 250) continue;
-    const score = Math.abs(entry.e - eGame);
+  // Partner the game's error with the claim whose implied press time matches best.
+  // Press order is only a tie-breaker: the hook can mis-claim when a lane is dense,
+  // and a pure FIFO pairing would then shift every later error onto the wrong note.
+  for (let i = 0; i < state.livePending.length; i++) {
+    const entry = state.livePending[i];
+    if (now - entry.at > 400) continue;
+    const timeDist = Math.abs(entry.point.time - implied);
+    if (timeDist > 250) continue;
+    const errDist = Math.abs(entry.e - eGame);
+    if (errDist > 150) continue;
+    const score = errDist + timeDist * 0.25;
     if (score < bestScore) {
       bestScore = score;
       best = entry;
+      bestIdx = i;
+    }
+  }
+  if (!best) {
+    let nearest = Infinity;
+    for (let i = 0; i < state.livePending.length; i++) {
+      const entry = state.livePending[i];
+      if (now - entry.at > 400) continue;
+      if (Math.abs(entry.point.time - implied) > 300) continue;
+      const score = Math.abs(entry.e - eGame);
+      if (score < nearest) {
+        nearest = score;
+        best = entry;
+        bestIdx = i;
+      }
     }
   }
   if (!best) {
@@ -1305,8 +1802,7 @@ function correctLiveError(eGame) {
     if (state.liveRecentErrors.length > 16) state.liveRecentErrors.shift();
     return;
   }
-  const idx = state.livePending.indexOf(best);
-  if (idx >= 0) state.livePending.splice(idx, 1);
+  state.livePending.splice(bestIdx, 1);
   const delta = best.e - eGame;
   if (Math.abs(delta) < 200) state.liveBias = clamp(state.liveBias * 0.8 + delta * 0.2, -150, 150);
   correctMatch(best.point, eGame);
@@ -1318,7 +1814,7 @@ function correctMatch(point, eGame) {
   state.errorSum += eGame - oldE;
   state.errorSq += eGame * eGame - oldE * oldE;
   point.e = eGame;
-  point.j = classifyError(eGame);
+  point.j = state.scoreV2 && point.end ? classifyV2Tail(point.note, eGame) : classifyError(eGame);
   point.at = point.time + eGame;
   const ns = state.noteState[point.note];
   if (ns) {
@@ -1328,6 +1824,7 @@ function correctMatch(point, eGame) {
       ns.head = point.j;
     }
   }
+  if (state.scoreV2 && !point.end) refreshV2Tail(point.note);
   if (!state.scoreV2) settleV1LongNote(point.note);
 }
 
@@ -1355,9 +1852,17 @@ function ensureLive() {
   if (!base || state.gameState !== "play" || !state.beatmap || !state.points) return;
   const key = `${state.checksum}.${state.beatmap.keys}`;
   if (state.liveKey === key) return;
-  state.liveKey = key;
   state.helperState = "connecting";
-  const source = new EventSource(helperEndpoint(`/live?keys=${state.beatmap.keys}`));
+  let source = null;
+  try {
+    source = new EventSource(helperEndpoint(`/live?keys=${state.beatmap.keys}`));
+  } catch (err) {
+    console.warn("[ManiaReplayMaster] helper hook unavailable:", (err && err.message) || err);
+    state.helperState = "error";
+    state.liveKey = "";
+    return;
+  }
+  state.liveKey = key;
   state.liveSource = source;
   let warned = false;
   source.onmessage = (ev) => {
@@ -1368,12 +1873,25 @@ function ensureLive() {
       return;
     }
     if (msg && msg.type === "hello") {
-      state.liveReady = true;
       state.helperState = "ready";
       state.helperLayout = String(msg.layout || "");
       state.helperHookError = String(msg.error || "");
+      state.liveReady = !!msg.hook;
       if (msg.hook) console.info(`[ManiaReplayMaster] hook layout: ${state.helperLayout} (${msg.from || "?"})`);
       else console.warn(`[ManiaReplayMaster] helper hook unavailable: ${state.helperHookError || "unknown error"}`);
+      return;
+    }
+    if (msg && msg.type === "error") {
+      state.helperHookError = String(msg.message || "helper error");
+      state.liveReady = false;
+      console.warn(`[ManiaReplayMaster] helper error: ${state.helperHookError}`);
+      return;
+    }
+    if (msg && msg.type === "hookexit") {
+      state.liveReady = false;
+      state.liveActive = false;
+      state.helperState = "error";
+      console.warn("[ManiaReplayMaster] keyboard hook exited");
       return;
     }
     if (!msg || msg.type !== "key") return;
@@ -1432,10 +1950,10 @@ async function fetchBeatmapTextFromListing() {
   const host = location.host;
   for (let folderPad = 0; folderPad <= 2; folderPad += 1) {
     const folderName = " ".repeat(folderPad) + folder;
-    const listUrl = `http://${host}/files/beatmap/${encodeURIComponent(folderName)}/`;
+    const listUrl = `${location.protocol}//${host}/files/beatmap/${encodeURIComponent(folderName)}/`;
     let html = "";
     try {
-      const response = await fetch(listUrl, { cache: "no-store" });
+      const response = await fetchWithTimeout(listUrl, 4000);
       if (!response.ok) continue;
       html = await response.text();
     } catch {
@@ -1443,9 +1961,9 @@ async function fetchBeatmapTextFromListing() {
     }
     const actualName = findListedBeatmapFile(html, fileName);
     if (!actualName) continue;
-    const fileUrl = `http://${host}/files/beatmap/${encodeURIComponent(folderName)}/${encodeURIComponent(actualName)}`;
+    const fileUrl = `${location.protocol}//${host}/files/beatmap/${encodeURIComponent(folderName)}/${encodeURIComponent(actualName)}`;
     try {
-      const response = await fetch(fileUrl, { cache: "no-store" });
+      const response = await fetchWithTimeout(fileUrl, 4000);
       if (!response.ok) continue;
       const text = await response.text();
       if (text && text.includes("osu file format")) return text;
@@ -1456,10 +1974,23 @@ async function fetchBeatmapTextFromListing() {
   return null;
 }
 
+function fetchWithTimeout(url, ms, opts) {
+  const options = Object.assign({ cache: "no-store" }, opts || {});
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return fetch(url, Object.assign({}, options, { signal: AbortSignal.timeout(ms) }));
+  }
+  if (typeof AbortController === "function") {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    return fetch(url, Object.assign({}, options, { signal: controller.signal })).finally(() => clearTimeout(timer));
+  }
+  return fetch(url, options);
+}
+
 async function fetchBeatmapText() {
   let primaryError = "";
   try {
-    const response = await fetch("/files/beatmap/file", { cache: "no-store" });
+    const response = await fetchWithTimeout("/files/beatmap/file", 5000);
     if (response.ok) {
       const text = await response.text();
       if (text && text.includes("osu file format")) return text;
@@ -1514,6 +2045,8 @@ async function ensureBeatmap() {
 
 function updateSettings(message) {
   if (!message || typeof message !== "object") return;
+  const modeBefore = analysisMode();
+  const exactLiveBefore = !!settings.exactLive;
   for (const [key, value] of Object.entries(message)) {
     if (!Object.prototype.hasOwnProperty.call(settings, key)) continue;
     let next = value;
@@ -1522,6 +2055,18 @@ function updateSettings(message) {
     if (settings[key] === next || Number.isNaN(next)) continue;
     settings[key] = next;
   }
+  if (modeBefore === analysisMode() && exactLiveBefore === !!settings.exactLive) return;
+  // Switching the judgement source mid-play leaves both pipelines half-applied (live keys
+  // ignored under exact, replay ignored under live). Drop whatever the previous mode set up.
+  const modeAfter = analysisMode();
+  if (!settings.exactLive || modeAfter === "Replay") closeLive();
+  if (modeAfter === "Live" && state.exactApplied) clearReplayRun();
+  state.pendingApply = false;
+  state.runPrefix = [];
+  state.cached = false;
+  state.cachedErrors = null;
+  state.cacheChecked = 0;
+  resetJudgements();
 }
 
 function makeScroll(cps, timeRange) {
@@ -1551,6 +2096,11 @@ function getScroll(map, timeRange) {
   renderCache.scrollMap = map;
   renderCache.scrollRange = timeRange;
   renderCache.scroll = scroll;
+  // The scroll mapping changed (reviewTime / scroll speed), so the visible-window cursor
+  // is stale: notes that already passed the hit line can be back inside the visible range.
+  renderCache.cursor = 0;
+  renderCache.cursorTime = -Infinity;
+  renderCache.cursorMap = null;
   return scroll;
 }
 
@@ -1630,7 +2180,7 @@ function drawActionHold(ctx, col, y1, y2, h, opacity) {
   const bottom = Math.max(y1, y2);
   ctx.globalAlpha = opacity * 0.9;
   ctx.fillStyle = settings.colorLongNote;
-  for (let y = bottom - h * 2; y > top; y -= h * 2) {
+  for (let y = bottom - h; y > top - h; y -= h * 2) {
     ctx.fillRect(cx - h / 2, y, h, h);
   }
 }
@@ -1639,22 +2189,34 @@ function unstableRate(t) {
   let n = state.statCount;
   let sum = state.errorSum;
   let sq = state.errorSq;
-  if (t !== undefined && (state.cached || state.exactApplied) && state.points) {
+  const exactMode = t !== undefined && (state.cached || state.exactApplied) && !!state.points;
+  // The exact path scans every point; reuse the result until the song clock reaches the
+  // next 250ms bucket instead of rescanning on every frame.
+  const cacheKey = `${state.cached ? 1 : 0}${state.exactApplied ? 1 : 0}|${state.statCount}|${Math.floor(num(t, 0) / 250)}`;
+  if (exactMode && state.urCache && state.urCache.key === cacheKey) return state.urCache.value;
+  if (exactMode) {
     n = 0;
     sum = 0;
     sq = 0;
+    const map = state.beatmap;
     for (const p of state.points) {
       if (!p.matched || p.e === null || p.at > t) continue;
+      // V1 scores a long note once: its head and tail points carry the same merged judgement.
+      if (!state.scoreV2 && p.end && map && map.notes[p.note] && map.notes[p.note].hold) continue;
       n += 1;
       sum += p.e;
       sq += p.e * p.e;
     }
   }
-  if (n < 2) return 0;
-  const mean = sum / n;
-  const variance = Math.max(0, sq / n - mean * mean);
-  const ur = Math.sqrt(variance) * 10;
-  return state.modsRate && state.modsRate !== 1 ? ur / state.modsRate : ur;
+  let ur = 0;
+  if (n >= 2) {
+    const mean = sum / n;
+    const variance = Math.max(0, sq / n - mean * mean);
+    ur = Math.sqrt(variance) * 10;
+    if (state.modsRate && state.modsRate !== 1) ur /= state.modsRate;
+  }
+  if (exactMode) state.urCache = { key: cacheKey, value: ur };
+  return ur;
 }
 
 function gameHitsTotal() {
@@ -1770,7 +2332,7 @@ function renderScene(ctx, t) {
   const cols = getColumns(map.keys);
   const noteH = clamp(num(settings.noteHeight, 22), 4, 80);
   const actionH = clamp(num(settings.actionHeight, 7), 2, 40);
-  const strokeW = Math.max(1, num(settings.noteStroke, 2));
+  const strokeW = Math.max(1, Math.min(12, num(settings.noteStroke, 2)));
   const opacity = clamp(num(settings.playfieldOpacity, 1), 0, 1);
 
   if (settings.showHitLine) {
@@ -1889,6 +2451,7 @@ function allowedState() {
 function statusText() {
   if (!state.gameState) return "waiting for tosu...";
   if (state.gameState !== "play") return "";
+  if (state.streamStale) return "tosu stream stalled, waiting for data...";
   if (state.mapMode !== "mania") return "mania only";
   if (!state.beatmap) {
     if (state.loadError) return `beatmap fetch failed: ${state.loadError} (retrying)`;
@@ -1907,14 +2470,19 @@ function statusText() {
 function frame() {
   requestAnimationFrame(frame);
   const nowMs = performance.now();
+  // A short tosu hiccup must not wipe the judgements on screen: mark the stream stale
+  // (rendering freezes on the last sample) and resume as soon as v2 comes back.
+  state.streamStale = !!(state.gameState === "play" && state.lastV2At && nowMs - state.lastV2At > 5000);
+  // Misses are decided by the song clock, so they must not be throttled by the render fps
+  // cap (a fpsLimit of 1 used to delay every miss colour by up to a second).
+  if (state.gameState === "play" && state.beatmap && state.beatmap.notes && !state.streamStale) {
+    sweepMisses(renderTime());
+  }
   const fpsLimit = clamp(num(settings.fpsLimit, 0), 0, 1000);
   if (fpsLimit > 0 && nowMs - lastFrameAt < 1000 / fpsLimit - 1) return;
   lastFrameAt = nowMs;
 
   resize();
-  if (state.gameState === "play" && state.lastV2At && nowMs - state.lastV2At > 2500) {
-    handleGameStateChange("not_ready");
-  }
   const width = canvas.width;
   const height = canvas.height;
   const text = statusText();
@@ -1933,8 +2501,7 @@ function frame() {
   }
 
   const t = renderTime();
-  sweepMisses(t);
-  const rev = `${t.toFixed(3)}|${state.beatmap.keys}|${state.errorCount}|${state.windows ? state.windows.join(",") : ""}|${settings.playfieldOpacity}|${settings.renderScale}|${settings.backgroundOpacity}|${settings.backgroundColor}|${settings.noteHeight}|${settings.noteStroke}|${settings.actionHeight}|${settings.hitPosition}|${settings.hitLineWidth}|${settings.reviewTime}|${settings.statsScale}|${settings.showActions}|${settings.showStats}|${settings.showHitLine}|${settings.colorUnjudged}|${settings.colorLongNote}|${width}|${height}`;
+  const rev = `${t.toFixed(3)}|${state.beatmap.keys}|${state.errorCount}|${state.windows ? state.windows.join(",") : ""}|${settings.playfieldOpacity}|${settings.renderScale}|${settings.backgroundOpacity}|${settings.backgroundColor}|${settings.noteHeight}|${settings.noteStroke}|${settings.actionHeight}|${settings.hitPosition}|${settings.hitLineWidth}|${settings.reviewTime}|${settings.statsScale}|${settings.showActions}|${settings.showStats}|${settings.showHitLine}|${settings.colorUnjudged}|${settings.colorLongNote}|${settings.colorPerfect}|${settings.colorGreat}|${settings.colorGood}|${settings.colorOk}|${settings.colorMeh}|${settings.colorMiss}|${settings.maniaScrollSpeedOverride}|${settings.showHitLine}|${state.cached ? 1 : 0}${state.exactApplied ? 1 : 0}|${width}|${height}`;
   if (rev === lastDrawRev) return;
   lastDrawRev = rev;
   wasVisible = true;
@@ -1958,13 +2525,18 @@ function frame() {
 
   ctx.setTransform(view.scale, 0, 0, view.scale, view.offsetX, view.offsetY);
   ctx.save();
-  ctx.beginPath();
-  ctx.rect(0, 0, 480, 480);
-  ctx.clip();
-  renderScene(ctx, t);
-  ctx.restore();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.globalAlpha = 1;
+  try {
+    ctx.beginPath();
+    ctx.rect(0, 0, 480, 480);
+    ctx.clip();
+    renderScene(ctx, t);
+  } catch (err) {
+    console.error("[ManiaReplayMaster] render error:", err);
+  } finally {
+    ctx.restore();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+  }
 }
 
 const sockets = new SocketManager(location.host);
@@ -2006,6 +2578,9 @@ function handleGameStateChange(stateName) {
     state.pendingApply = true;
     state.lastHitsTotal = null;
     state.lastScore = 0;
+    state.hits = null;
+    state.accuracy = 100;
+    state.lastLive = NaN;
     resetExactRun();
     resetJudgements();
   } else if (stateName !== "play" && state.gameState === "play") {
@@ -2048,7 +2623,7 @@ function applyPlayUpdate(play) {
   state.failed = !!play.failed;
   const acc = Number(play.accuracy);
   if (Number.isFinite(acc)) state.accuracy = acc;
-  if (state.gameState === "play" && !state.cached && state.hits) {
+  if (state.gameState === "play" && state.hits) {
     const totalHits =
       num(state.hits.geki, 0) +
       num(state.hits["300"], 0) +
@@ -2057,9 +2632,14 @@ function applyPlayUpdate(play) {
       num(state.hits["50"], 0) +
       num(state.hits["0"], 0);
     const score = Number(play.score);
+    // ScoreV2 recalculates on every judgement: releasing an LN early re-judges it as a
+    // miss and can make play.score go *down* by a few points while a hit was just added.
+    // Treating that as "the map restarted" resets every rendered note (the mass revert
+    // users see). Only a real restart empties the hit counters, so use those.
+    const noteTotal = state.beatmap && Array.isArray(state.beatmap.notes) ? state.beatmap.notes.length : 0;
+    const hitsSlack = Math.max(2, Math.round(noteTotal * 0.002));
     const restarted =
-      state.lastHitsTotal !== null &&
-      (totalHits < state.lastHitsTotal || (Number.isFinite(score) && state.lastScore > 0 && score < state.lastScore - 1));
+      state.lastHitsTotal !== null && totalHits + hitsSlack < state.lastHitsTotal;
     if (restarted) {
       state.runPrefix = [];
       state.pendingApply = false;
@@ -2097,7 +2677,14 @@ function onV2(data) {
   }
   const live = Number(data.beatmap && data.beatmap.time && data.beatmap.time.live);
   if (Number.isFinite(live)) {
-    if (state.gameState === "play" && !state.cached && live < state.lastLive - 500) resetJudgements();
+    if (state.gameState === "play" && live < state.lastLive - 500) {
+      // A live clock going backwards means the map restarted or was seeked: the replay
+      // cache no longer describes what the game is judging.
+      state.pendingApply = false;
+      state.runPrefix = [];
+      clearReplayRun();
+      resetJudgements();
+    }
     state.lastLive = live;
     setTime(live);
   }
@@ -2127,6 +2714,14 @@ function onPrecise(data) {
   if (Number.isFinite(current)) setTime(current);
   updateKeyHints(data.keys);
   if (state.liveActive) applyLiveCorrections(data.hitErrors);
+  if (state.exactApplied && Array.isArray(data.hitErrors) && state.statCount > 50 && data.hitErrors.length + 50 < state.statCount) {
+    // The game is judging a fresh attempt while an old replay result is still applied:
+    // drop the stale replay so the live pipeline can take over.
+    state.pendingApply = false;
+    state.runPrefix = [];
+    clearReplayRun();
+    resetJudgements();
+  }
   if (state.exactApplied || state.liveActive) return;
   const arr = data.hitErrors;
   if (!Array.isArray(arr)) return;
@@ -2155,7 +2750,10 @@ function onPrecise(data) {
     state.cacheChecked = arr.length;
     return;
   }
-  if (arr.length < state.errorCount) resetJudgements();
+  if (arr.length < state.errorCount) {
+    state.runPrefix = [];
+    resetJudgements();
+  }
   if (arr.length > state.errorCount) {
     const count = arr.length - state.errorCount;
     if (count > 1 || stalled || state.errorCount === 0 || state.timeSpeed > 1.25) {
@@ -2196,12 +2794,15 @@ helperHeartbeat();
 
 sockets.open("/websocket/v2", onV2, v2Filters);
 sockets.open("/websocket/v2/precise", onPrecise, null);
-sockets.open("/websocket/commands", onCommand, null);
+sockets.open("/websocket/commands", onCommand, null, () => requestSettings(0));
 requestSettings();
 
 window.addEventListener("beforeunload", () => {
   if (state.gameState === "play" && !state.cached && state.statCount > 0) saveRun(false);
 });
+
+// Closing sockets explicitly keeps tosu from logging dropped clients on page unload.
+window.addEventListener("pagehide", () => sockets.closeAll());
 
 window.__maniaReplayMaster = {
   state,
@@ -2225,6 +2826,13 @@ window.__maniaReplayMaster = {
   applyRun,
   runStorageKey,
   fitExactOffset,
+  exactOffsetFor,
+  replayWindowTable,
+  getJudgementClass,
+  judgeRelease,
+  judgeReplayNotes,
+  replayJudgementCounts,
+  classifyV2Tail,
   applyExactTimeline,
   applyExactData,
   maybeExact,
@@ -2237,7 +2845,6 @@ window.__maniaReplayMaster = {
   clearReplayRun,
   exactReplayReady,
   analysisMode,
-  lockPoint,
   helperBase,
   helperEndpoint,
   ensureBeatmap,

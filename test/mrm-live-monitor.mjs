@@ -127,12 +127,13 @@ console.log("请正常游玩一张 mania 图（无需重开，支持多图）...
 
 const ws = new WebSocket(`ws://${tosu}/websocket/v2`);
 ws.addEventListener("open", () => {
-  ws.send(JSON.stringify([
+  ws.send(`applyFilters:${JSON.stringify([
     "client",
     { field: "state", keys: ["name"] },
     { field: "play", keys: ["mods", "hits", "accuracy", { field: "mode", keys: ["name"] }] },
     { field: "beatmap", keys: ["mode", "checksum", "stats", { field: "time", keys: ["live"] }] }
-  ]));
+  ])}`);
+  ws.send("client");
 });
 ws.addEventListener("message", (msg) => {
   let data = null;

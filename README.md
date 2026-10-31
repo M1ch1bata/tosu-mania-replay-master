@@ -5,7 +5,7 @@
 
 > A real-time mania replay & judgement overlay for tosu, inspired by Mania-Replay-Master.
 
-> **本目录是代码审查后的修复版本（v0.5.3，基于上游 0.5.0）**：修复清单见 [FIXES.md](FIXES.md)，更新说明见 [中文](CHANGELOG.zh.md) / [English](CHANGELOG.en.md)。
+> **本目录是代码审查后的修复版本（v0.5.4，基于上游 0.5.0；0.5.4 重写了回放判定模型）**：修复清单见 [FIXES.md](FIXES.md)，更新说明见 [中文](CHANGELOG.zh.md) / [English](CHANGELOG.en.md)。
 
 ![插件实时运行情况](docs/插件实时运行情况.gif)
 
@@ -44,7 +44,7 @@
 # 方式一：git clone（可直接克隆进 static 目录）
 git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static/Mania Replay Master"
 
-# 方式二：下载 ZIP 解压后，将文件夹重命名为 Mania Replay Master 放入 tosu/static/
+# 方式二：下载 ZIP 解压后放入 tosu/static/（本副本的文件夹名为 Mania Replay Master (fixed)）
 ```
 
 重启 tosu 后，在 tosu 控制台的计数器 / 覆盖层列表中即可看到 **Mania Replay Master**。
@@ -52,7 +52,8 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
 ### 添加为覆盖层
 
 - **OBS**：添加「浏览器源」，URL 填
-  `http://127.0.0.1:24050/Mania%20Replay%20Master/index.html`
+  `http://127.0.0.1:24050/Mania%20Replay%20Master%20(fixed)/index.html`
+  （URL 里的目录名必须和 `tosu/static` 下的文件夹名一致；本副本的目录名带 `(fixed)`，若你把文件夹改回 `Mania Replay Master`，去掉 `%20(fixed)` 即可）
   （也可省略 URL 后缀，直接在 tosu 页面复制该插件的地址）；
 - **游戏内覆盖层**：在 tosu 设置中开启 `enableIngameOverlay`，并把本插件加入显示列表。
 

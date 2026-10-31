@@ -96,4 +96,7 @@ else {
   if (missing) console.log("      WARN: 有列没收到按键，见上面提示");
   else console.log("      PASS: 事件通道正常");
 }
+const failed = !hello || !hello.hook || !events.length;
+console.log(failed ? "      exit 1 (hook/channel broken)" : "      exit 0");
 void aborted;
+process.exit(failed ? 1 : 0);

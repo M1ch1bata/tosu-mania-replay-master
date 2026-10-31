@@ -8,7 +8,7 @@
   - **osu!stable**：窗口消息 → `InputManager` → mania 每列按键状态；回放 `x` 字段就是逐列位掩码；内存里的 mania key overlay 每个元素对应一列。
 - tosu 的 API 只固定输出 `keys.k1/k2/m1/m2` 四个槽；stable 的读取器更是只构造 3 个元素（`if (mode === 0)` 才补第 4 个）。所以 5K–10K 拿不到完整列信息。
 
-插件侧（0.7.1 起）已经能消费完整列数组：`precise.keys` 可以是数组，或 `precise.keys.maniaKeys` 数组；收到后按列提示 + `hitErrors` 精确误差判定，多 K 自动生效。
+插件侧（0.5.4 起）已经能消费完整列数组：`precise.keys` 可以是数组，或 `precise.keys.maniaKeys` 数组；收到后按列提示 + `hitErrors` 精确误差判定，多 K 自动生效。注意插件读取的是 **`data.keys.maniaKeys`**（`main.js` 的 `updateKeyHints(data.keys)`），所以补丁必须把 `maniaKeys` 加在 `keys` 对象**内部**，放到返回对象的顶层不会生效。
 
 ## 补丁 1：API 层（对 stable/lazer 都需要）
 
@@ -33,11 +33,18 @@ return {
 ```diff
      return {
          currentTime: global.playTime,
-+        maniaKeys: gameplay.keyOverlay.map((k) => ({
-+            isPressed: k.isPressed,
-+            count: k.count
-+        })),
          keys: {
+             k1: { ... },
+             k2: { ... },
+             m1: { ... },
+-            m2: { ... }
++            m2: { ... },
++            // Must live inside `keys`: the plugin reads data.keys.maniaKeys.
++            maniaKeys: gameplay.keyOverlay.map((k) => ({
++                isPressed: k.isPressed,
++                count: k.count
++            }))
+         },
 ```
 
 `buildResult.ts`（v1/gosumemory）里的 `gameplay.keyOverlay` 同理，插件不依赖 v1，可一并加。

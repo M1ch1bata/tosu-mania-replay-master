@@ -56,6 +56,7 @@ vm.runInContext(code, sb, { filename: "main.js" });
 const api = sb.window.__maniaReplayMaster;
 
 const helper = spawn("node", [`${root}\\tools\\mrm-helper.mjs`], { windowsHide: true, stdio: "ignore" });
+helper.on("error", (err) => console.log("FAIL helper spawn", String((err && err.message) || err)));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0;
 let fail = 0;
@@ -64,6 +65,7 @@ const ok = (name, cond, extra) => {
   else { fail += 1; console.log("FAIL ", name, extra === undefined ? "" : JSON.stringify(extra)); }
 };
 
+let skipped = false;
 try {
   let ready = false;
   for (let i = 0; i < 40 && !ready; i++) {
@@ -77,7 +79,10 @@ try {
   ok("helper up", ready);
   const md5 = process.env.MRM_TEST_MD5 || "0092e13ec401d11a9b053b92e0e9093e";
   const mapIndexPath = process.env.MRM_MAP_INDEX || "C:\\Users\\96549\\AppData\\Local\\Temp\\opencode\\mma-test\\map-index.json";
-  if (!fs.existsSync(mapIndexPath)) { console.log("SKIP: map index not found (set MRM_MAP_INDEX)"); process.exit(0); }
+  if (!fs.existsSync(mapIndexPath)) {
+    skipped = true;
+    throw new Error("map index not found (set MRM_MAP_INDEX)");
+  }
   const mapIndex = JSON.parse(fs.readFileSync(mapIndexPath, "utf8"));
   const parsed = api.parseOsu(fs.readFileSync(mapIndex[md5], "utf8"));
   const keys = 4;
@@ -111,10 +116,18 @@ try {
   const ur = api.unstableRate();
   ok("UR computed", Number.isFinite(ur) && ur > 0, Math.round(ur));
 } catch (err) {
-  fail += 1;
-  console.log("FAIL ", String(err && err.stack || err));
+  if (skipped) {
+    console.log("SKIP: map index not found, set MRM_MAP_INDEX to run the end-to-end exact replay test");
+  } else {
+    fail += 1;
+    console.log("FAIL ", String(err && err.stack || err));
+  }
 } finally {
   helper.kill();
+}
+if (skipped) {
+  console.log("Summary: SKIPPED (exit 2, helper killed)");
+  process.exit(2);
 }
 console.log(`Summary: ${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);
