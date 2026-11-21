@@ -5,7 +5,7 @@
 
 > A real-time mania replay & judgement overlay for tosu, inspired by Mania-Replay-Master.
 
-> **本目录是代码审查后的修复版本（v0.5.5，基于上游 0.5.0；0.5.5 加入 Mirror / Random mod 支持与覆盖层自愈）**：修复清单见 [FIXES.md](FIXES.md)，更新说明见 [中文](CHANGELOG.zh.md) / [English](CHANGELOG.en.md)。
+> **本目录是代码审查后的修复版本（v0.5.6，基于上游 0.5.0；0.5.6 加入匀速下落，0.5.5 加入 Mirror / Random mod 支持与覆盖层自愈）**：修复清单见 [FIXES.md](FIXES.md)，更新说明见 [中文](CHANGELOG.zh.md) / [English](CHANGELOG.en.md)。
 
 ![插件实时运行情况](docs/插件实时运行情况.gif)
 
@@ -25,6 +25,7 @@
   - V1 / Classic：整根长条使用「头 + 尾」合成判定（与 `judgeRelease` 规则一致）；
   - ScoreV2：长条始终为单个中性矩形、不随判定变色，头 / 尾判定由各自的按键动作标记体现。
 - **按键动作层**：按下 / 抬起以实心标记绘制在实际判定的位置；长按虚线从按下开始随时间生长，抬起后补全整段，偏移对比不会突然跳出。
+- **匀速下落（默认开）**：忽略谱面 timing point 的 BPM / SV，音符全程以恒定速度下落，复盘时不会被谱面的变速梗干扰；需要还原游戏内变速表现时可在设置里关掉。
 - **变速支持**：0.5x – 2x 回放可用（时间外推、顺序对齐、MISS 跳段对齐）。
 - **键位 mod 支持**：识别 Mirror（MR）、Random（RD）等键位 mod。Mirror 按游戏内翻转后的列渲染；Random 从 `.osr` 的种子帧重建本局列置换（游玩中则用前 ~48 个按键推断）。格式与算法见 `docs/stable-mania-random.md`。
 - **可调外观**：判定线位置与粗细、下落速度、线后审查时间、统计面板缩放、颜色、透明度、渲染缩放、帧率上限等。
@@ -75,6 +76,7 @@ git clone https://github.com/M1ch1bata/tosu-mania-replay-master.git "tosu/static
 | Judgement Review Time (ms) | 判定线后至少保留的可见时间；过高滚动速度会自动放慢 | `1500` |
 | Stats Panel Scale | 左上统计面板缩放 | `1.4` |
 | Mania Scroll Speed Override | 覆盖游戏滚动速度（0 = 跟随游戏） | `0` |
+| Uniform Scroll Speed (ignore BPM/SV) | 全程匀速，忽略谱面 BPM/SV（回放分析推荐）；关闭则按谱面 timing 变速 | 开 |
 | Show Actions / Stats / Hit Line | 是否绘制动作层 / 统计面板 / 判定线 | 开 |
 | Playfield Opacity | 整体不透明度 | `1` |
 | Background Color / Opacity | 背景色与不透明度（0 = 全透明） | `#000000` / `0` |

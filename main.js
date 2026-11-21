@@ -48,6 +48,7 @@ const settings = {
   reviewTime: 1500,
   statsScale: 1.4,
   maniaScrollSpeedOverride: 0,
+  uniformScroll: true,
   showActions: true,
   showStats: true,
   showHitLine: true,
@@ -169,6 +170,7 @@ const renderCache = {
   scroll: null,
   scrollMap: null,
   scrollRange: 0,
+  scrollUniform: false,
   cursorMap: null,
   cursorTime: -Infinity,
   cursor: 0
@@ -2508,13 +2510,24 @@ function makeScroll(cps, timeRange) {
   };
 }
 
-function getScroll(map, timeRange) {
-  if (renderCache.scroll && renderCache.scrollMap === map && renderCache.scrollRange === timeRange) {
+// uniform=true ignores the map's BPM/SV timeline and maps song time to distance
+// linearly (makeScroll(null) is the pure x/timeRange line), so notes fall at one
+// constant speed. Replay analysis usually wants this: chart speed-ups are gimmicks,
+// not something the reviewer needs to see.
+function getScroll(map, timeRange, uniform) {
+  const linear = !!uniform;
+  if (
+    renderCache.scroll &&
+    renderCache.scrollMap === map &&
+    renderCache.scrollRange === timeRange &&
+    renderCache.scrollUniform === linear
+  ) {
     return renderCache.scroll;
   }
-  const scroll = makeScroll(map.cps, timeRange);
+  const scroll = makeScroll(linear ? null : map.cps, timeRange);
   renderCache.scrollMap = map;
   renderCache.scrollRange = timeRange;
+  renderCache.scrollUniform = linear;
   renderCache.scroll = scroll;
   // The scroll mapping changed (reviewTime / scroll speed), so the visible-window cursor
   // is stale: notes that already passed the hit line can be back inside the visible range.
@@ -2747,7 +2760,7 @@ function renderScene(ctx, t) {
   if (!map || !map.notes || !map.notes.length) return;
   const hitPos = clamp(num(settings.hitPosition, 80), 60, 470);
   const timeRange = effectiveTimeRange(hitPos);
-  const scroll = getScroll(map, timeRange);
+  const scroll = getScroll(map, timeRange, settings.uniformScroll);
   const now = scroll.at(t);
   const cols = getColumns(map.keys);
   const noteH = clamp(num(settings.noteHeight, 22), 4, 80);
@@ -3085,7 +3098,7 @@ function frame() {
   }
 
   const t = renderTime();
-  const rev = `${t.toFixed(3)}|${state.beatmap.keys}|${state.errorCount}|${state.windows ? state.windows.join(",") : ""}|${settings.playfieldOpacity}|${settings.renderScale}|${settings.backgroundOpacity}|${settings.backgroundColor}|${settings.noteHeight}|${settings.noteStroke}|${settings.actionHeight}|${settings.hitPosition}|${settings.hitLineWidth}|${settings.reviewTime}|${settings.statsScale}|${settings.showActions}|${settings.showStats}|${settings.showHitLine}|${settings.colorUnjudged}|${settings.colorLongNote}|${settings.colorPerfect}|${settings.colorGreat}|${settings.colorGood}|${settings.colorOk}|${settings.colorMeh}|${settings.colorMiss}|${settings.maniaScrollSpeedOverride}|${settings.showHitLine}|${state.cached ? 1 : 0}${state.exactApplied ? 1 : 0}|${width}|${height}`;
+  const rev = `${t.toFixed(3)}|${state.beatmap.keys}|${state.errorCount}|${state.windows ? state.windows.join(",") : ""}|${settings.playfieldOpacity}|${settings.renderScale}|${settings.backgroundOpacity}|${settings.backgroundColor}|${settings.noteHeight}|${settings.noteStroke}|${settings.actionHeight}|${settings.hitPosition}|${settings.hitLineWidth}|${settings.reviewTime}|${settings.statsScale}|${settings.showActions}|${settings.showStats}|${settings.showHitLine}|${settings.colorUnjudged}|${settings.colorLongNote}|${settings.colorPerfect}|${settings.colorGreat}|${settings.colorGood}|${settings.colorOk}|${settings.colorMeh}|${settings.colorMiss}|${settings.maniaScrollSpeedOverride}|${settings.uniformScroll ? 1 : 0}|${settings.showHitLine}|${state.cached ? 1 : 0}${state.exactApplied ? 1 : 0}|${width}|${height}`;
   // Even when nothing changed, repaint once a second: a canvas whose backing store was
   // discarded (hidden page / GPU reset) otherwise stays blank until the next judgement.
   if (rev === lastDrawRev && nowMs - lastPaintAt < 1000) {

@@ -1,3 +1,11 @@
+# Mania Replay Master v0.5.6 — Update Notes
+
+**Minor update**: a uniform scroll mode, so replay analysis is not driven by the chart's BPM/SV gimmicks.
+
+- **Uniform Scroll Speed (on by default)**: the renderer ignores the map's timing-point BPM and SV and maps song time to distance linearly, so every note falls at the same speed. Turn it off to get the in-game chart speed (including SV tricks).
+- The scroll mapping cache now separates uniform and chart modes, so toggling the setting takes effect immediately without reusing a stale mapping.
+- Tests: 148/148 (new assertions for the linear mapping and cache separation).
+
 # Mania Replay Master v0.5.5 — Update Notes
 
 **Minor update**: Mirror / Random mod support, a fix for the overlay going blank after switching apps or taking a QQ screenshot, a compact status line, and a cleanup of development-only scripts and internal review notes.

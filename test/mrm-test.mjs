@@ -172,6 +172,21 @@ const tr80 = api.effectiveTimeRange(80);
 const post80 = (480 - 80) / (80 / tr80);
 ok("line at 80 keeps review >= 1500ms", post80 >= 1500, +post80.toFixed(1));
 
+console.log("== uniform scroll ==");
+ok("uniform scroll is on by default", api.settings.uniformScroll === true, api.settings.uniformScroll);
+const bpmMap = { keys: 4, notes: [], cps: [{ time: 0, m: 1 }, { time: 1000, m: 2 }, { time: 2000, m: 0.5 }], bars: [] };
+const linScroll = api.getScroll(bpmMap, 2000, true);
+ok(
+  "uniform scroll ignores the chart BPM/SV",
+  close([linScroll.at(1000), linScroll.at(2000)], [0.5, 1]),
+  [linScroll.at(1000), linScroll.at(2000)]
+);
+const chartScroll = api.getScroll(bpmMap, 2000, false);
+ok("chart scroll still follows BPM/SV when disabled", Math.abs(chartScroll.at(2000) - 1.5) < 1e-9, chartScroll.at(2000));
+const linAgain = api.getScroll(bpmMap, 2000, true);
+ok("scroll cache separates uniform and chart modes", Math.abs(linAgain.at(2000) - 1) < 1e-9, linAgain.at(2000));
+api.settings.uniformScroll = true;
+
 console.log("== playback rate estimation ==");
 sb.__advance(150);
 api.setTime(0);

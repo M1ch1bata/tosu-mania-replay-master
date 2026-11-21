@@ -136,6 +136,14 @@
         "value": 0
     },
     {
+        "uniqueID": "uniformScroll",
+        "type": "checkbox",
+        "title": "Uniform Scroll Speed (ignore BPM/SV)",
+        "description": "on: notes always fall at one constant speed, chart BPM/SV changes are not rendered (recommended for replay analysis); off: follow the map timing like the game",
+        "options": [],
+        "value": true
+    },
+    {
         "uniqueID": "showActions",
         "type": "checkbox",
         "title": "Show Key Actions",
